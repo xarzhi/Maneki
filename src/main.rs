@@ -41,6 +41,12 @@ const TOP_H: f32 = 38.0;
 const BOTTOM_H: f32 = 96.0;
 /// 鼠标静止多久后自动收起
 const HIDE_AFTER: Duration = Duration::from_secs(2);
+/// 点完播放/暂停之后，最多容忍 mpv 多久还没「回声」。
+///
+/// 正常情况下播放线程几毫秒就追上来了，这个值只是兜底：万一 mpv 不认这条命令
+/// （文件坏了之类），超时之后还是要老老实实跟着快照走，否则按钮会永远停在
+/// 用户点出来的那个状态上，跟实际播放状况对不上。
+const PAUSE_ECHO: Duration = Duration::from_millis(300);
 /// 一批拖放要「安静」这么久才算拖完（一次拖多个文件时事件是连着来的）
 const DROP_SETTLE: Duration = Duration::from_millis(120);
 /// 收起/展开的过渡时间常数（约 0.09s 走完 63%，体感 250ms 左右）
@@ -312,6 +318,13 @@ struct App {
     /// 转圈动画的相位，0..1 一整圈
     spin: f32,
     paused: bool,
+    /// 最近一次「播放 / 暂停」是什么时候发给 mpv 的。
+    ///
+    /// 播放线程的快照永远比命令慢半拍：点下暂停的那一瞬间，队列里还压着一两条
+    /// 「pause=no」的旧快照，照抄回来就会把按钮先翻成「暂停」再翻回「播放」——
+    /// 用户看到的就是按钮闪一下。所以记下发送时刻，等快照追上（或者等超时）之后
+    /// 才重新采信 `snap.paused`。
+    pause_sent: Option<Instant>,
     duration: f64,
     position: f64,
     volume: f64,
@@ -433,6 +446,7 @@ impl App {
             loading_since: None,
             spin: 0.0,
             paused: true,
+            pause_sent: None,
             duration: 0.0,
             position: 0.0,
             volume: 80.0,
@@ -540,6 +554,9 @@ impl App {
         self.position = 0.0;
         self.duration = 0.0;
         self.paused = false;
+        // 换片子也是一次「命令在路上」：上一条如果是暂停状态，队列里还压着
+        // 「pause=yes」的快照，别让它把新片子的按钮画成暂停。
+        self.pause_sent = Some(Instant::now());
         self.error = None;
         self.bars = 1.0;
         self.last_active = Instant::now();
@@ -725,10 +742,6 @@ impl App {
 
     // ---------------- 顶底栏的显隐逻辑 ----------------
 
-    fn playing(&self) -> bool {
-        self.frame.is_some() && !self.paused
-    }
-
     /// 鼠标是不是停在某条栏上（停上面时不应该收起，否则点不到按钮）
     fn cursor_over_bars(&self) -> bool {
         let Some(p) = self.cursor else { return false };
@@ -748,7 +761,13 @@ impl App {
         if self.playlist.open {
             return true;
         }
-        if !self.playing() {
+        // 一条片子都没有（启动后的空白页 / 换片空档）时栏留着：那时候无所谓
+        // 「让画面干净点」，而且栏上的打开、设置这些按钮还得能点。
+        //
+        // 暂停**不再**特殊对待：以前这里写的是 `!self.playing()`，于是只要暂停，
+        // 两条栏就一直挂在上面，鼠标移开窗口也不会收。现在统一成一条规则 ——
+        // 静置 2 秒就滑走，暂停也一样。
+        if self.frame.is_none() {
             return true;
         }
         // popover / 右键菜单展开时底栏必须留着，否则滑块会跟着一起收走
@@ -827,6 +846,26 @@ impl App {
         (waited / SPIN_FADE).min(1.0)
     }
 
+    /// 播放线程喊「现在是暂停/播放状态」，该不该采信。
+    ///
+    /// 返回 `None` = 这条快照的 paused 不能用（命令还在路上）。
+    ///
+    /// 背景：点和画面到 mpv 真的停住之间隔着一条队列，`self.paused` 已经在本地
+    /// 翻过去了，队列里那几条旧快照还写着老值。照抄回去就是「按钮先翻回暂停、
+    /// 下一帧再翻回来」——用户看到的就是闪一下。所以刚发过命令的那一小段时间
+    /// 里，只认跟本地一致的值；等快照追上、或者超过 `PAUSE_ECHO` 兜底，恢复同步。
+    fn resolve_paused(&mut self, snap_paused: bool) -> Option<bool> {
+        let Some(sent_at) = self.pause_sent else {
+            return Some(snap_paused);
+        };
+        // 快照追上了（哪怕只是「mpv 现在就是你说得那样」），从此不再拦
+        if snap_paused == self.paused || sent_at.elapsed() >= PAUSE_ECHO {
+            self.pause_sent = None;
+            return Some(snap_paused);
+        }
+        None
+    }
+
     /// 收下后台探测出来的时长，按路径填回列表。
     fn drain_probe(&mut self) {
         let got = match &self.prober {
@@ -849,6 +888,8 @@ impl App {
             return;
         }
         self.paused = !self.paused;
+        // 先记时刻再发命令：勾上之后 `tick()` 才不会拿旧快照把按钮翻回去
+        self.pause_sent = Some(Instant::now());
         self.send(Cmd::Pause(self.paused));
     }
 
@@ -886,8 +927,10 @@ impl App {
                 }
                 // 没画面（空白页 / 还没出首帧）时不要跟着 mpv 走：
                 // 空闲的 mpv 报告 pause=no，照抄会让空界面上的按钮显示成「暂停」。
-                if self.frame.is_some() {
-                    self.paused = snap.paused;
+                if self.frame.is_some()
+                    && let Some(p) = self.resolve_paused(snap.paused)
+                {
+                    self.paused = p;
                 }
                 self.open_ms = snap.open_ms;
                 self.fps = snap.fps;
@@ -1653,6 +1696,7 @@ impl App {
                 self.win_size = s;
                 self.touch();
             }
+            // 栏 / 覆盖层故意「吃掉」按下事件用的占位消息，到这里什么也不做
             Message::Noop => {}
         }
         Task::none()
@@ -3023,6 +3067,15 @@ mod tests {
         app.flush_drops();
     }
 
+    /// 一张 2x2 的假画面：只为了满足 `frame.is_some()` 这类判断，内容无所谓
+    fn screen() -> crate::video::VideoFrame {
+        crate::video::VideoFrame {
+            data: std::sync::Arc::new(vec![0; 16]),
+            width: 2,
+            height: 2,
+        }
+    }
+
     #[test]
     fn one_batch_of_drops_becomes_one_playlist() {
         let root = make_dir(
@@ -3333,11 +3386,7 @@ mod tests {
         assert_eq!(at!(80 + 60_000), 1.0);
 
         // 首帧到手 —— 不管之前算了多少，立刻归零
-        app.frame = Some(crate::video::VideoFrame {
-            data: std::sync::Arc::new(vec![0; 16]),
-            width: 2,
-            height: 2,
-        });
+        app.frame = Some(screen());
         assert_eq!(at!(80 + 2000), 0.0, "有画面了还画圈就盖住视频了");
 
         // 报错了也不该转圈（错误面板自己会说清楚）
@@ -3349,6 +3398,68 @@ mod tests {
         app.error = None;
         app.current = None;
         assert_eq!(at!(80 + 2000), 0.0);
+    }
+
+    /// 点完播放/暂停的那一下，按钮必须**立刻**变成新状态，并且不被队列里的
+    /// 旧快照翻回去 —— 这就是「暂停时按钮闪一下」的根因。
+    #[test]
+    fn pause_toggle_ignores_stale_snapshots_until_echo_arrives() {
+        let mut app = app();
+        app.frame = Some(screen());
+        app.paused = false;
+
+        // 点一下暂停：本地立刻是 paused，同时记下发送时刻
+        app.toggle_play();
+        assert!(app.paused, "按钮要立刻变成「播放」");
+        assert!(app.pause_sent.is_some());
+
+        // 队列里那条旧快照（还写着「在放」）不能把它翻回去
+        assert_eq!(app.resolve_paused(false), None, "旧快照不该采信");
+        assert!(app.paused, "按钮不能闪回暂停图标");
+
+        // 真正的回声到了：采信，并且以后不再拦
+        assert_eq!(app.resolve_paused(true), Some(true));
+        assert!(app.pause_sent.is_none(), "追上之后要停止拦截");
+        assert_eq!(app.resolve_paused(false), Some(false), "之后的快照照常同步");
+    }
+
+    /// 兜底：mpv 万一不认这条命令，也不能让按钮永远停在用户点出来的状态上
+    #[test]
+    fn pause_toggle_gives_up_after_timeout() {
+        let mut app = app();
+        app.frame = Some(screen());
+        app.paused = true;
+        // 假装那一下是 300ms 之前发的（已经超过 PAUSE_ECHO）
+        app.pause_sent = Some(Instant::now() - PAUSE_ECHO);
+
+        // 快照跟本地不一致，但也不能再拦了
+        assert_eq!(app.resolve_paused(false), Some(false));
+        assert!(app.pause_sent.is_none());
+    }
+
+    /// 暂停不再是「栏永远挂着」的理由：鼠标静置够久，两条栏照样收起来
+    #[test]
+    fn bars_hide_while_paused_too() {
+        let mut app = app();
+        app.frame = Some(screen());
+        app.paused = true;
+        app.cursor = Some(Point::new(400.0, 300.0)); // 停在画面中间，不在栏上
+        app.last_active = Instant::now() - HIDE_AFTER - Duration::from_millis(50);
+        assert!(!app.want_bars(), "暂停 + 鼠标闲着，栏应该收起来");
+
+        // 鼠标移到顶栏上：不能收，不然点不到按钮
+        app.cursor = Some(Point::new(400.0, 10.0));
+        assert!(app.want_bars(), "鼠标停在栏上时必须留着");
+
+        // 刚动过鼠标：留着
+        app.cursor = Some(Point::new(400.0, 300.0));
+        app.last_active = Instant::now();
+        assert!(app.want_bars(), "刚动过鼠标时不能马上收");
+
+        // 压根没片子（启动后的空白页）：栏也要一直留着
+        app.frame = None;
+        app.last_active = Instant::now() - HIDE_AFTER - Duration::from_millis(50);
+        assert!(app.want_bars(), "空白页上栏不能收");
     }
 
     /// 转圈的相位只在换片期间往前走，转满一圈要回到 0（不然浮点数会越加越大）
