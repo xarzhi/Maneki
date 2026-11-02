@@ -67,6 +67,12 @@ const ANIM_TAU: f32 = 0.09;
 /// 本地小文件常常 50~80ms 就出首帧了，门一开到就画圈会在每次切集时闪一下，
 /// 反而更难看。超过这个时长说明确实在等（大文件、机械盘、网络盘），才值得提示。
 const SPIN_DELAY: Duration = Duration::from_millis(80);
+/// 换片时**手上还顶着上一帧**的情况（见 `App::stale_frame`）要等更久才画圈。
+///
+/// mpv 换片时本来就会把上一条继续渲染到新文件接手为止（实测交接大约 100ms），
+/// 画面是连着的。这时候要是按 `SPIN_DELAY` 就把圈和暗色压上去，用户看到的是
+/// 「画面暗一下又亮回来」，等于自己造了一次闪。拖到这个时长还没新帧，才是真的卡住了。
+const STALE_SPIN_DELAY: Duration = Duration::from_millis(400);
 /// 转圈从出现到完全不透明的淡入时长（秒）
 const SPIN_FADE: f32 = 0.16;
 /// 窗口四边/四角的缩放热区厚度
@@ -327,6 +333,16 @@ struct App {
     /// 当前文件的路径（文件对话框默认从这里打开）
     current: Option<PathBuf>,
     frame: Option<video::VideoFrame>,
+    /// 手上这一帧是不是**上一条**片子留下的。
+    ///
+    /// 换片时不再立刻把 `frame` 清成 `None`（那样画面会先黑一下，用户看到的就是
+    /// 「闪一下」），而是留着上一帧继续画，等新片的首帧到了再换。这个标记用来
+    /// 区分「这帧是当前片子的」还是「只是个占位」，加载拖长时才好决定要不要
+    /// 压暗加转圈。
+    stale_frame: bool,
+    /// 换片的代次号。每发一次 `Cmd::Load` / `Cmd::Stop` 就 +1，
+    /// 只采信带着这个号的快照 —— 见 `Cmd::Load` 的说明。
+    load_gen: u64,
     /// 这一条片子是什么时候开始加载的（`play()` 里记，出首帧时清）。
     /// 换片那一小段空档靠它判断要不要画转圈，以及画了多久。
     loading_since: Option<Instant>,
@@ -460,6 +476,8 @@ impl App {
             title: String::from("Maneki"),
             current: None,
             frame: None,
+            stale_frame: false,
+            load_gen: 0,
             loading_since: None,
             spin: 0.0,
             pulse: 0.0,
@@ -564,7 +582,12 @@ impl App {
         // 列表里如果有这一条，顺手把高亮对上（用户点了别的、或播完自动接续都靠这个）
         self.playlist.select = self.playlist.index_of(&path);
         self.eof_prev = false;
-        self.frame = None;
+        // **不**清 `frame`：留着上一帧继续画。
+        // 清成 None 的话，从点下去到新片出首帧这段（几十毫秒到几百毫秒）画面会是
+        // 一整块黑 —— 用户看到的就是「切视频时闪一下」。这里只打个标记，等新片
+        // 首帧到了（`tick()` 里）再换掉；真加载得久，`spinner_opacity()` 会把旧画面
+        // 压暗并叠一个转圈，也不会突兀地黑屏。
+        self.stale_frame = self.frame.is_some();
         // 从这一刻起算「在加载」，出首帧时（tick 里）清掉
         self.loading_since = Some(Instant::now());
         self.spin = 0.0;
@@ -588,7 +611,8 @@ impl App {
         self.sid = None;
         self.sub_hint = None;
 
-        player.send(Cmd::Load(path));
+        self.load_gen = self.load_gen.wrapping_add(1);
+        player.send(Cmd::Load(path, self.load_gen));
     }
 
     /// 把当前这条卸掉，回到「列表里有东西、但一条都没在放」的状态。
@@ -600,6 +624,7 @@ impl App {
         self.current = None;
         self.title = String::from("Maneki");
         self.frame = None;
+        self.stale_frame = false;
         self.loading_since = None;
         self.duration = 0.0;
         self.position = 0.0;
@@ -618,6 +643,9 @@ impl App {
         self.info = None;
         self.eof_prev = false;
         self.error = None;
+        // 代次也往前推一格：在途的旧快照（还是上一条片子的画面/进度）一律不认，
+        // 否则刚清空的界面会被它们重新填回旧数字。
+        self.load_gen = self.load_gen.wrapping_add(1);
         self.send(Cmd::Stop);
     }
 
@@ -895,17 +923,26 @@ impl App {
         if spin_preview() {
             return 1.0;
         }
-        if self.frame.is_some() || self.is_audio() || self.error.is_some() || self.current.is_none()
+        // 手上这一帧得是**当前这条片子**的才算「有画面」。换片空档里留着的是上一条
+        // 的最后一帧（见 `play()` 里的 `stale_frame`），它只是在顶着不黑屏，
+        // 不能让转圈永远不出现 —— 真加载得久了，还是要转起来告诉用户「在读」。
+        if (self.frame.is_some() && !self.stale_frame)
+            || self.is_audio()
+            || self.error.is_some()
+            || self.current.is_none()
         {
             return 0.0;
         }
         let Some(since) = self.loading_since else {
             return 0.0;
         };
-        let waited = now
-            .saturating_duration_since(since)
-            .saturating_sub(SPIN_DELAY)
-            .as_secs_f32();
+        // 手上还顶着上一帧时，等得更久（原因见 `STALE_SPIN_DELAY`）
+        let delay = if self.frame.is_some() {
+            STALE_SPIN_DELAY
+        } else {
+            SPIN_DELAY
+        };
+        let waited = now.saturating_duration_since(since).saturating_sub(delay).as_secs_f32();
         (waited / SPIN_FADE).min(1.0)
     }
 
@@ -950,7 +987,10 @@ impl App {
         // 还没开始放（打开文件夹之后停在这里）：按播放就从列表第一条起播。
         // 不这么做的话，这颗按钮在「从列表里挑一个」的界面上是颗死按钮，
         // 用户第一反应就是「坏了」。
-        if self.frame.is_none() && !self.is_audio() {
+        //
+        // 换片空档（手上顶着上一帧的占位画面）也当「还没开始放」处理：
+        // 那时候去翻 `paused` 只会给一个正在加载的 mpv 发个没意义的暂停命令。
+        if (self.frame.is_none() || self.stale_frame) && !self.is_audio() {
             if self.current.is_none() && !self.playlist.items.is_empty() {
                 self.play_index(0);
             }
@@ -1013,6 +1053,7 @@ impl App {
         self.flush_drops();
         self.drain_probe();
 
+
         // 别的实例把路径转交过来了（又双击了一次 exe / 把视频「打开方式」选成本程序）：
         // 走和拖放完全一样的 open_paths，所以「第二次打开」的效果和拖进来一致。
         if let Some(paths) = pending_open() {
@@ -1024,9 +1065,14 @@ impl App {
         let mut advance_to = None;
 
         if let Some(player) = &self.player {
-            if let Some(snap) = player.poll() {
+            // 只认自己这一代的快照。刚发完 Load / Stop 时，队列里躺着的那份
+            // 还是上一条片子的（画面、进度、时长都是旧的），采信它就会
+            // 「先黑一下、旧画面回来、再跳到新片」—— 就是切换时那一下闪。
+            if let Some(snap) = player.poll().filter(|s| s.load_id == self.load_gen) {
                 if let Some(f) = snap.frame {
                     self.frame = Some(f);
+                    // 新片的首帧到了，手上这帧不再是「占位」
+                    self.stale_frame = false;
                     // 首帧到手，转圈可以收了
                     self.loading_since = None;
                 }
@@ -1034,6 +1080,10 @@ impl App {
                     // 音频没有「首帧」可等：引擎打开就代表加载完了。
                     // 不在这里清掉，转圈会一直挂在那块唱片上面。
                     self.loading_since = None;
+                    // 从视频切到音频时，上一帧还挂在手上 —— 界面已经按 `is_audio()`
+                    // 走到唱片那一支了，这帧没人画，白占着一块显存，扔掉。
+                    self.frame = None;
+                    self.stale_frame = false;
                 }
                 // 时长：
                 // - 视频：mpv 说了算，报 0 时（还在解析）先用列表里探测到的值顶着
@@ -1911,26 +1961,51 @@ impl App {
         let stage: Element<'_, Message> = if let Some(err) = &self.error {
             self.error_panel(err)
         } else if let Some(f) = &self.frame {
+            let picture: Element<'_, Message> = iced::widget::shader(VideoProgram {
+                frame: Some(f.clone()),
+                fit: self.settings.fit,
+                aspect: self.settings.aspect,
+                look: self.settings.look,
+            })
+            .width(Fill)
+            .height(Fill)
+            .into();
+
+            // 换片空档：这里是上一条的最后一帧在顶着（`stale_frame`）。
+            // 真加载得久的话，转圈会从 0 淡进来，同时压一层暗色 ——
+            // 不然「一动不动的高亮画面 + 一个白圈」看着像卡死了。
+            let o = self.spinner_opacity();
+            let body: Element<'_, Message> = if o > 0.0 {
+                stack![
+                    picture,
+                    container(spinner::view(self.spin, o))
+                        .center(Fill)
+                        .style(move |_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.55 * o,
+                            ))),
+                            ..container::Style::default()
+                        }),
+                ]
+                .into()
+            } else {
+                picture
+            };
+
             // 点画面 = 暂停/继续。必须 on_press + on_release 成对使用：
             // 只挂 on_release 的话，点顶底栏（它们的按下会被栏吃掉、松手却没有）
             // 松手时画面这层照样会收到 release，于是「点一下栏就暂停」。
-            mouse_area(
-                iced::widget::shader(VideoProgram {
-                    frame: Some(f.clone()),
-                    fit: self.settings.fit,
-                    aspect: self.settings.aspect,
-                    look: self.settings.look,
-                })
-                .width(Fill)
-                .height(Fill),
-            )
-            .interaction(mouse::Interaction::Idle)
-            .on_press(Message::StagePress)
-            .on_release(Message::StageRelease)
-            // 右键菜单：给了 `on_right_press` 之后这一层才会捕获右键，
-            // 而左键的按下/松手完全不受影响（pause 照旧走 StagePress/StageRelease）。
-            .on_right_press(Message::ContextMenu)
-            .into()
+            mouse_area(body)
+                .interaction(mouse::Interaction::Idle)
+                .on_press(Message::StagePress)
+                .on_release(Message::StageRelease)
+                // 右键菜单：给了 `on_right_press` 之后这一层才会捕获右键，
+                // 而左键的按下/松手完全不受影响（pause 照旧走 StagePress/StageRelease）。
+                .on_right_press(Message::ContextMenu)
+                .into()
         } else if self.is_audio() {
             // 纯音频：没有画面可画，给它一块自己的静物界面。
             // 也要挂上「点一下暂停」—— 音频用户同样习惯点空白处切歌。
@@ -3430,6 +3505,7 @@ mod tests {
         assert_eq!(app.playlist.select, None, "不该替用户选第一条");
         assert!(app.current.is_none(), "要停在「挑一个」，而不是接着放旧的");
         assert!(app.frame.is_none());
+        assert!(!app.stale_frame, "占位帧的标记也要一起清掉");
         assert_eq!(app.position, 0.0);
         assert_eq!(app.duration, 0.0);
         assert!(!app.paused, "还没开始放，不该显示暂停态");
@@ -3750,6 +3826,51 @@ mod tests {
         app.error = None;
         app.current = None;
         assert_eq!(at!(80 + 2000), 0.0);
+    }
+
+    /// 换片时手上顶着上一帧（`stale_frame`）：画面是连着的，转圈要等更久才出现 ——
+    /// 按 `SPIN_DELAY` 就画，会在每次切集时「暗一下又亮回来」，等于自己造一次闪。
+    #[test]
+    fn a_leftover_frame_delays_the_spinner() {
+        let mut app = app();
+        app.current = Some(std::path::PathBuf::from("next.mp4"));
+        app.frame = Some(screen());
+        app.stale_frame = true;
+        let t0 = Instant::now();
+        app.loading_since = Some(t0);
+
+        macro_rules! at {
+            ($ms:expr) => {
+                app.spinner_opacity_at(t0 + Duration::from_millis($ms))
+            };
+        }
+
+        // 平时的门（80ms）已经开了，但有旧画面顶着，这时候还不该画
+        assert_eq!(at!(80 + 200), 0.0, "画面还连着的时候就画圈，会暗一下再亮回来");
+        assert_eq!(at!(399), 0.0);
+
+        // 真的卡住了（超过 STALE_SPIN_DELAY）才转起来
+        assert_eq!(
+            at!(STALE_SPIN_DELAY.as_millis() as u64 + 2000),
+            1.0,
+            "加载真的卡住了要给出反馈"
+        );
+
+        // 新片首帧到了：标记清掉，圈立刻收
+        app.stale_frame = false;
+        assert_eq!(at!(STALE_SPIN_DELAY.as_millis() as u64 + 2000), 0.0);
+    }
+
+    /// 换片空档里按空格：手上那帧只是占位的，不该被当成「正在播」去翻暂停，
+    /// 更不该给正在加载的 mpv 塞一条暂停命令。
+    #[test]
+    fn space_during_a_switch_does_not_pause_the_incoming_file() {
+        let mut app = playing_at(10.0);
+        app.frame = Some(screen());
+        app.stale_frame = true;
+
+        let _ = app.update(Message::TogglePlay);
+        assert!(!app.paused, "换片空档不该把新片按成暂停");
     }
 
     /// 点完播放/暂停的那一下，按钮必须**立刻**变成新状态，并且不被队列里的

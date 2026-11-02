@@ -24,7 +24,14 @@ const MAX: Size<u32> = Size::new(1920, 1080);
 
 /// 发往播放线程的指令。
 pub enum Cmd {
-    Load(PathBuf),
+    /// 换片。第二个参数是 UI 那边给的**代次号**：线程会把它原样写进之后所有
+    /// 快照里，UI 只认自己当前这一代。
+    ///
+    /// 没有这个号会出问题：`play()` 发完 Load 立刻 poll，拿到的往往还是
+    /// 「还没轮到处理 Load」的旧快照，里面是**上一条片子的画面**。UI 一旦采信，
+    /// 就会出现「先黑一下、旧画面又回来、过一会儿才换成新片」—— 用户看到的就是
+    /// 切换时闪一下。
+    Load(PathBuf, u64),
     /// 卸掉当前的片子，回到「什么都没在放」的状态。
     ///
     /// 打开文件夹时用：那时候只是把列表装好，等用户自己点一条再放。
@@ -54,6 +61,8 @@ pub type Frame = VideoFrame;
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub frame: Option<Frame>,
+    /// 这份快照是哪一代 Load 的产物。UI 只认自己当前这一代 —— 见 `Cmd::Load`。
+    pub load_id: u64,
     /// 这一条是纯音频：`frame` 永远是 None，界面要画音频版的舞台，
     /// 而且不能用「有没有画面」来判断「加载完了没有」。
     pub audio: bool,
@@ -163,13 +172,16 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
     let mut volume: f64 = 80.0;
     // 已经 Stop 掉了：这期间不读任何引擎状态，只回报一个「空」快照
     let mut stopped = false;
+    // 当前代次：只有处理过 Load 之后才等于 UI 给的那个号，之前的快照都还是旧的
+    let mut load_gen: u64 = 0;
 
     loop {
         // ---------- 1. 处理指令 ----------
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                Cmd::Load(path) => {
+                Cmd::Load(path, id) => {
                     stopped = false;
+                    load_gen = id;
                     snap.error = None;
                     snap.frame = None;
                     snap.position = 0.0;
@@ -249,6 +261,8 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
                     rodio_active = false;
                     audio_mode = false;
                     stopped = true;
+                    // 归零：UI 那边的代次从 1 起，这样卸载之后在途的旧快照一律不认
+                    load_gen = 0;
                     snap = Snapshot::default();
                     snap.paused = true;
                     open_at = None;
@@ -447,6 +461,7 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
         }
 
         // ---------- 6. 回报 ----------
+        snap.load_id = load_gen;
         match snap_tx.try_send(snap.clone()) {
             Ok(_) | Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => return,
