@@ -1,0 +1,75 @@
+[package]
+name = "maneki"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "0.14.0", features = ["image-without-codecs", "tokio", "canvas"] }
+libloading = "0.9.0"
+rfd = "0.17.2"
+
+# 给 exe 塞图标 + 版本信息（build.rs 里用）
+[build-dependencies]
+embed-resource = "3.0"
+
+# 视频播放依赖热点循环（像素拷贝、RGB 转换），debug 下需要优化否则掉帧
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# ---------------- 安装包 ----------------
+#
+# `cargo packager --release` 在 dist\ 下生成 Maneki_<版本>_x64-setup.exe。
+# 版本号唯一来源是上面 [package] 的 version，打包脚本（package.ps1）负责改它。
+[package.metadata.packager]
+productName = "Maneki"
+identifier = "com.maneki.player"
+description = "极速打开、全格式解码的 Windows 视频播放器"
+authors = ["Maneki"]
+icons = ["assets/logo.ico"]
+formats = ["nsis"]
+outDir = "dist"
+# exe 只有 11 MB，真正干活的是这个解码库，必须跟主程序装进同一个目录
+resources = ["vendor/libmpv-2.dll"]
+
+[package.metadata.packager.nsis]
+installerIcon = "assets/logo.ico"
+# 安装界面说中文。NSIS 自带 SimpChinese 语言文件，这里只要点名即可。
+languages = ["SimpChinese"]
+# 不管用户在安装向导里选哪个目录，程序最后都落在它自己的子目录里：
+#   D:\Program Files\maneki        ->  D:\Program Files\maneki\Maneki
+#   D:\Program Files\maneki\       ->  D:\Program Files\maneki\Maneki
+#   D:\Program Files\maneki\Maneki  ->  原样不动
+# 把 exe 和 uninstall.exe 直接撒在 D:\Downloads 里，以后想清理都不知道删哪些。
+#
+# cargo-packager 没有「目录页回调」这种配置，只能挂 `preinstallSection`
+# —— 它以一段普通 Section 的形式插在 `Section Install` 之前，此时目录页早就
+# 结束、$INSTDIR 就是用户最后选的那个路径，正好可以在这里补一层子目录。
+# 下面的写法用 `${PRODUCTNAME}` 而不是硬编码 "Maneki"，改产品名时不用同步改这里。
+preinstallSection = '''
+Section DirSuffix
+  ; 从资源管理器复制来的路径常常带个尾巴反斜杠，先削掉，
+  ; 不然会拼成 D:\foo\\Maneki。
+  StrCpy $R9 $INSTDIR 1 -1
+  StrCmp $R9 "\" 0 +2
+    StrCpy $INSTDIR $INSTDIR -1
+
+  ; 最后一段已经是产品名就不再套一层（StrCmp 不分大小写），
+  ; 免得装出 ...\Maneki\Maneki。
+  StrLen $R8 "\${PRODUCTNAME}"
+  IntOp $R8 0 - $R8
+  StrCpy $R9 $INSTDIR "" $R8
+  StrCmp $R9 "\${PRODUCTNAME}" done
+  StrCpy $INSTDIR "$INSTDIR\${PRODUCTNAME}"
+  done:
+SectionEnd
+'''
+

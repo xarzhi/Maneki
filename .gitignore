@@ -1,0 +1,30 @@
+# ---------------- Rust 构建产物 ----------------
+/target/
+**/*.rs.bk
+*.pdb
+
+# ---------------- 打包产物 ----------------
+# cargo packager 的输出：setup.exe 一个就 40 MB，而且每次打包都能重新生成
+/dist/
+
+# ---------------- 解码器（必须自己放，不进仓库） ----------------
+# vendor/libmpv-2.dll 有 117 MB，超过 GitHub 单文件 100 MB 的硬限制，推不上去。
+# 自己从上游 libmpv 的 Windows 构建里拿一份丢进 vendor\ 就行，文件名必须是
+# libmpv-2.dll —— 运行时要它，package.ps1 也会把它一起塞进安装包。
+/vendor/
+
+# ---------------- 本地测试素材 ----------------
+# 拿来压测「几十 GB 也能秒开」的样片，加起来 6 GB 多，别往仓库里塞。
+# assets/sample.mp4 特意不忽略：只有 13 MB，examples/probe.rs 默认就用它。
+/assets/big.mp4
+/assets/bands.mkv
+
+# 验证脚本抽帧出来的裸 RGB、录屏中间产物
+*.rgb
+*.rawvideo
+
+# ---------------- 系统垃圾 ----------------
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log

@@ -1,0 +1,184 @@
+{
+  "id": "5249320",
+  "name": "Meow TV",
+  "font_family": "iconfont",
+  "css_prefix_text": "icon-",
+  "description": "",
+  "glyphs": [
+    {
+      "icon_id": "23223544",
+      "name": "工程资源管理器-folder-open",
+      "font_class": "folder",
+      "unicode": "e69d",
+      "unicode_decimal": 59037
+    },
+    {
+      "icon_id": "37625030",
+      "name": "播放速度",
+      "font_class": "speed",
+      "unicode": "e646",
+      "unicode_decimal": 58950
+    },
+    {
+      "icon_id": "22632637",
+      "name": "详情",
+      "font_class": "xiangqing",
+      "unicode": "e637",
+      "unicode_decimal": 58935
+    },
+    {
+      "icon_id": "45725258",
+      "name": "字幕",
+      "font_class": "zimu",
+      "unicode": "e6f6",
+      "unicode_decimal": 59126
+    },
+    {
+      "icon_id": "1167180",
+      "name": "删除",
+      "font_class": "delete",
+      "unicode": "e645",
+      "unicode_decimal": 58949
+    },
+    {
+      "icon_id": "5286714",
+      "name": "全屏",
+      "font_class": "fullscreen",
+      "unicode": "e63f",
+      "unicode_decimal": 58943
+    },
+    {
+      "icon_id": "5954685",
+      "name": "下一首播放",
+      "font_class": "next-play",
+      "unicode": "e786",
+      "unicode_decimal": 59270
+    },
+    {
+      "icon_id": "6776386",
+      "name": "声音_实体",
+      "font_class": "sound",
+      "unicode": "eca5",
+      "unicode_decimal": 60581
+    },
+    {
+      "icon_id": "7801438",
+      "name": "亮色版本_分页器向后",
+      "font_class": "up-arrow",
+      "unicode": "e642",
+      "unicode_decimal": 58946
+    },
+    {
+      "icon_id": "7801439",
+      "name": "亮色版本_分页器向前",
+      "font_class": "down-arrow",
+      "unicode": "e643",
+      "unicode_decimal": 58947
+    },
+    {
+      "icon_id": "8152834",
+      "name": "桌面歌词_上一曲_44",
+      "font_class": "pre",
+      "unicode": "e66c",
+      "unicode_decimal": 58988
+    },
+    {
+      "icon_id": "9393394",
+      "name": "添加",
+      "font_class": "add",
+      "unicode": "e6a1",
+      "unicode_decimal": 59041
+    },
+    {
+      "icon_id": "9974760",
+      "name": "减",
+      "font_class": "minimize",
+      "unicode": "e711",
+      "unicode_decimal": 59153
+    },
+    {
+      "icon_id": "10176434",
+      "name": "播放",
+      "font_class": "bofang",
+      "unicode": "e628",
+      "unicode_decimal": 58920
+    },
+    {
+      "icon_id": "11172669",
+      "name": "search",
+      "font_class": "search",
+      "unicode": "e602",
+      "unicode_decimal": 58882
+    },
+    {
+      "icon_id": "11390192",
+      "name": "close",
+      "font_class": "close",
+      "unicode": "e609",
+      "unicode_decimal": 58889
+    },
+    {
+      "icon_id": "12323755",
+      "name": "全屏",
+      "font_class": "maximize",
+      "unicode": "e655",
+      "unicode_decimal": 58965
+    },
+    {
+      "icon_id": "16534188",
+      "name": "播放列表管理",
+      "font_class": "playing-list",
+      "unicode": "e60c",
+      "unicode_decimal": 58892
+    },
+    {
+      "icon_id": "18289155",
+      "name": "开始1",
+      "font_class": "play",
+      "unicode": "e622",
+      "unicode_decimal": 58914
+    },
+    {
+      "icon_id": "20877944",
+      "name": "icon_commone_seting",
+      "font_class": "setting",
+      "unicode": "e611",
+      "unicode_decimal": 58897
+    },
+    {
+      "icon_id": "21107385",
+      "name": "亮度",
+      "font_class": "light",
+      "unicode": "e61b",
+      "unicode_decimal": 58907
+    },
+    {
+      "icon_id": "36601138",
+      "name": "暗色",
+      "font_class": "dark",
+      "unicode": "e724",
+      "unicode_decimal": 59172
+    },
+    {
+      "icon_id": "46301066",
+      "name": "桌面歌词_上一曲_44-copy",
+      "font_class": "next",
+      "unicode": "eca6",
+      "unicode_decimal": 60582
+    },
+    {
+      "icon_id": "46331510",
+      "name": "亮色版本_分页器向前-copy",
+      "font_class": "right-arrow",
+      "unicode": "eca7",
+      "unicode_decimal": 60583
+    },
+    {
+      "icon_id": "46331511",
+      "name": "亮色版本_分页器向前-copy-copy",
+      "font_class": "left-arrow",
+      "unicode": "eca8",
+      "unicode_decimal": 60584
+    }
+  ]
+}
