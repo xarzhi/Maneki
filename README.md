@@ -2,25 +2,25 @@
 
 **用 Rust + iced 写的 Windows 视频播放器**
 
-![image-20261102190026746](https://gitee.com/xarzhi/picture/raw/master/img/image-20261102190026746.png)
+![Maneki 图标：一只橘猫在看电视](screenshots/00-logo.png)
 
 ## 页面展示
 
 ### 常规页面
 
-![PixPin_2026-11-02_18-43-18](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-43-18.png)
+![空白首页：拖入文件、打开文件、打开文件夹](screenshots/01-home.png)
 
 ### 播放界面
 
-![PixPin_2026-11-02_18-46-37](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-46-37.png)
+![播放中的画面与底栏控制](screenshots/02-playing.png)
 
 ### 播放列表
 
-![PixPin_2026-11-02_18-51-49](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-51-49.png)
+![右侧播放列表抽屉](screenshots/03-playlist.png)
 
 ### 干净的播放窗口
 
-![PixPin_2026-11-02_18-48-56](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-48-56.png)
+![控制栏自动收起后的播放窗口](screenshots/04-clean.png)
 
 ## 特性
 
