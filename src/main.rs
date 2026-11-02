@@ -591,6 +591,36 @@ impl App {
         player.send(Cmd::Load(path));
     }
 
+    /// 把当前这条卸掉，回到「列表里有东西、但一条都没在放」的状态。
+    ///
+    /// 打开文件夹后停在这里，等用户自己点一条。和 `play()` 的区别是：
+    /// `play()` 是换一条接着放，这里是一条都不放 —— 所以除了清界面状态，
+    /// 还要给引擎发 `Cmd::Stop`，否则上一条片子还在解码，下一帧就冒出来了。
+    fn unload(&mut self) {
+        self.current = None;
+        self.title = String::from("Maneki");
+        self.frame = None;
+        self.loading_since = None;
+        self.duration = 0.0;
+        self.position = 0.0;
+        self.paused = false;
+        // 卸载不涉及暂停，把「命令在路上」的标记清掉，
+        // 免得下一次 play 的头几帧被它挡着不认快照
+        self.pause_sent = None;
+        self.seek_at = None;
+        self.video_size = None;
+        self.open_ms = None;
+        self.fps = 0.0;
+        self.tracks.clear();
+        self.embedded_subs = false;
+        self.sid = None;
+        self.sub_hint = None;
+        self.info = None;
+        self.eof_prev = false;
+        self.error = None;
+        self.send(Cmd::Stop);
+    }
+
     /// 播列表里的第几条
     fn play_index(&mut self, index: usize) {
         let Some(item) = self.playlist.items.get(index) else {
@@ -627,7 +657,7 @@ impl App {
     ///
     /// - 单个文件：直接播它，列表里就这一条
     /// - 文件夹 / 一次拖进来好几个：把里面的视频和音频按自然顺序全装进列表，
-    ///   先播第一个，同时把右边的抽屉拉开让用户自己挑
+    ///   **一条都不自动播**，把右边的抽屉拉开，等用户点哪条放哪条
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
         let scan = playlist::scan(&paths);
 
@@ -641,6 +671,8 @@ impl App {
                 String::from("这里面没有可以播放的文件")
             });
             self.playlist.open = true;
+            // 注意：这里**不动**正在播的那条 —— 拖进来一堆认不出的文件，
+            // 不该把用户正在看的片子顺手停掉
             return;
         }
 
@@ -670,7 +702,10 @@ impl App {
         // 抽屉只能开一条：设置 / 字幕浮层这时候都该让位
         self.settings.close();
         self.sub_popover = false;
-        self.play_index(0);
+        // **不自动播第一个**。原来的做法是 `play_index(0)`，可文件夹往往是几百集的
+        // 剧或者一整张专辑，替用户决定「先放第一个」经常不是他想要的（尤其是
+        // 想从中间接着看的时候）。现在把引擎卸掉，界面停在「从列表里挑一个」。
+        self.unload();
         self.start_probe();
     }
 
@@ -912,8 +947,13 @@ impl App {
     /// 播放 / 暂停。键盘空格、点画面、点播放键都走这里。
     fn toggle_play(&mut self) {
         self.touch();
-        // 音频没有画面（`frame` 永远是 None），所以这里判的是「有没有片子」
+        // 还没开始放（打开文件夹之后停在这里）：按播放就从列表第一条起播。
+        // 不这么做的话，这颗按钮在「从列表里挑一个」的界面上是颗死按钮，
+        // 用户第一反应就是「坏了」。
         if self.frame.is_none() && !self.is_audio() {
+            if self.current.is_none() && !self.playlist.items.is_empty() {
+                self.play_index(0);
+            }
             return;
         }
         self.paused = !self.paused;
@@ -1918,6 +1958,10 @@ impl App {
                     ..container::Style::default()
                 })
                 .into()
+        } else if !self.playlist.items.is_empty() {
+            // 列表已经装好了，但一条都还没开始放（打开文件夹后的默认状态）。
+            // 这里不用再把「拖文件进来」摆一遍 —— 用户刚拖完，那样等于当没收到。
+            self.pick_stage()
         } else {
             container(
                 column![
@@ -2111,6 +2155,41 @@ impl App {
             .height(Fill)
             .style(black_style)
             .into()
+    }
+
+    /// 「列表里已经有东西了、但一条都还没开始放」的舞台。
+    ///
+    /// 打开文件夹后停在这里：右边抽屉里是刚扫出来的列表，用户点哪条就放哪条。
+    /// 不能沿用下面那张「把文件拖进来」的空白页 —— 用户刚拖完，那样等于当没收到。
+    fn pick_stage(&self) -> Element<'_, Message> {
+        let n = self.playlist.items.len();
+        container(
+            column![
+                iced::widget::image(iced::widget::image::Handle::from_rgba(
+                    LOGO_BIG_SRC,
+                    LOGO_BIG_SRC,
+                    LOGO_BIG_RGBA,
+                ))
+                .width(Length::Fixed(LOGO_HERO))
+                .height(Length::Fixed(LOGO_HERO)),
+                text("从列表里挑一个开始播放")
+                    .font(icon::UI_FONT)
+                    .size(20)
+                    .color(icon::TEXT_DIM),
+                text(format!("已经装进来 {n} 项 · 在右侧列表里点一条就播"))
+                    .font(icon::UI_FONT)
+                    .size(14)
+                    .color(icon::TEXT_FAINT),
+            ]
+            .spacing(12)
+            .align_x(Alignment::Center),
+        )
+        .center(Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::BLACK)),
+            ..container::Style::default()
+        })
+        .into()
     }
 
     /// 纯音频的舞台：中间一块「唱片」+ 文件名 + 状态。
@@ -2349,9 +2428,12 @@ impl App {
         .align_y(Alignment::Center);
 
         // 中间：上一集 / 播放暂停 / 下一集
+        // 一条都没加载时（打开文件夹后的「挑一个」界面）画的必须是播放三角，
+        // 暂停图标会让人以为正放着。
+        let idle = self.current.is_none();
         let center = row![
             icon_button(icon::PREV, 20.0, Message::Prev),
-            play_button(self.paused),
+            play_button(self.paused || idle),
             icon_button(icon::NEXT, 20.0, Message::Next),
         ]
         .spacing(14)
@@ -3316,13 +3398,66 @@ mod tests {
 
         let names: Vec<&str> = app.playlist.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["S01E2.mp4", "第1集.mp4", "第2集.mp4", "第10集.mp4"]);
-        // 第一条自动播，抽屉拉开
-        assert_eq!(app.playlist.select, Some(0));
+        // 一整批（文件夹）装进来**一条都不自动播**，抽屉拉开等用户点
+        assert_eq!(app.playlist.select, None);
         assert!(app.playlist.open);
+        // 界面要停在「挑一个」的状态：没有当前文件、也没有画面
+        assert!(app.current.is_none());
+        assert!(app.frame.is_none());
+        assert_eq!(app.duration, 0.0);
+        assert_eq!(app.position, 0.0);
         // 嵌套子目录要标出来源
         assert_eq!(app.playlist.items[0].group.as_deref(), Some("Season 1"));
         // 根目录下的文件不该有 group
         assert!(app.playlist.items[1].group.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 正在放片子的时候再扔一个文件夹进来：不能接着放新列表的第一条，
+    /// 而且上一部片子的画面、进度、时长都要清干净（不然界面会挂着旧数字）
+    #[test]
+    fn opening_a_folder_stops_whatever_was_playing() {
+        let root = make_dir("qp_test_drop_folder_idle", &["b1.mp4", "b2.mp4"]);
+
+        let mut app = playing_at(30.0);
+        app.frame = Some(screen());
+
+        let _ = app.update(Message::Dropped(root.clone()));
+        drop_now(&mut app);
+
+        assert_eq!(app.playlist.items.len(), 2);
+        assert_eq!(app.playlist.select, None, "不该替用户选第一条");
+        assert!(app.current.is_none(), "要停在「挑一个」，而不是接着放旧的");
+        assert!(app.frame.is_none());
+        assert_eq!(app.position, 0.0);
+        assert_eq!(app.duration, 0.0);
+        assert!(!app.paused, "还没开始放，不该显示暂停态");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 「挑一个」界面上按播放键 / 空格：从列表第一条起播，而不是没反应。
+    /// 列表是空的时候仍然什么都不做（不能凭空造一条出来）。
+    #[test]
+    fn play_from_idle_starts_the_first_item() {
+        let root = make_dir("qp_test_play_idle", &["c1.mp4", "c2.mp4"]);
+
+        // 空列表时按播放：什么都不做（不能凭空造一条出来）
+        let mut blank = app();
+        let _ = blank.update(Message::TogglePlay);
+        assert!(blank.current.is_none());
+        assert_eq!(blank.playlist.select, None);
+
+        let mut app = app();
+        let _ = app.update(Message::Dropped(root.clone()));
+        drop_now(&mut app);
+        assert_eq!(app.playlist.select, None);
+
+        let _ = app.update(Message::TogglePlay);
+        assert_eq!(app.playlist.select, Some(0), "按播放应该从第一条开始");
+        assert!(app.current.is_some());
+        assert!(!app.paused);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3371,6 +3506,8 @@ mod tests {
         let _ = app.update(Message::Dropped(root.clone()));
         drop_now(&mut app);
         assert_eq!(app.playlist.items.len(), 3);
+        // 扔文件夹不再自动播第一条，先手动点一条，后面的上/下一集才有起点
+        let _ = app.update(Message::PlayIndex(0));
 
         // 列表里前进 / 后退，而不是快进 10 秒
         let _ = app.update(Message::Next);

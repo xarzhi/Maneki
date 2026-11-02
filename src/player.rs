@@ -25,6 +25,12 @@ const MAX: Size<u32> = Size::new(1920, 1080);
 /// 发往播放线程的指令。
 pub enum Cmd {
     Load(PathBuf),
+    /// 卸掉当前的片子，回到「什么都没在放」的状态。
+    ///
+    /// 打开文件夹时用：那时候只是把列表装好，等用户自己点一条再放。
+    /// 不光要清界面状态，还得真的把引擎停掉 —— 否则上一条片子还在解码，
+    /// 下一帧照样会冒出来盖住界面。
+    Stop,
     Pause(bool),
     Seek(f64),
     Volume(f64),
@@ -155,12 +161,15 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
     let mut rodio_active = false;
     // 记住音量：每次新建 Sink 都得重新下发一遍（新 Sink 默认是 1.0）
     let mut volume: f64 = 80.0;
+    // 已经 Stop 掉了：这期间不读任何引擎状态，只回报一个「空」快照
+    let mut stopped = false;
 
     loop {
         // ---------- 1. 处理指令 ----------
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Load(path) => {
+                    stopped = false;
                     snap.error = None;
                     snap.frame = None;
                     snap.position = 0.0;
@@ -232,6 +241,20 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
                         }
                     }
                 }
+                Cmd::Stop => {
+                    mpv.stop();
+                    if let Some(e) = audio_engine.as_mut() {
+                        e.stop();
+                    }
+                    rodio_active = false;
+                    audio_mode = false;
+                    stopped = true;
+                    snap = Snapshot::default();
+                    snap.paused = true;
+                    open_at = None;
+                    open_ms = None;
+                    tracks_at = None;
+                }
                 Cmd::Pause(p) => {
                     if rodio_active {
                         if let Some(e) = &audio_engine {
@@ -301,12 +324,27 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
         // 放音频时 mpv 是空闲的（甚至刚被 stop 过），它吐出来的错误不是当前文件的问题
         if let Some(e) = outcome.error
             && !audio_mode
+            && !stopped
         {
             snap.error = Some(format!("这个文件打不开：\n{e}"));
             open_at = None;
         }
 
-        if rodio_active {
+        if stopped {
+            // 卸载之后一律回报「空」。这里必须整个跳过读状态的逻辑：
+            // mpv 的 `time-pos` / `eof-reached` 在 stop 之后还留着上一条的尾巴，
+            // 照抄回去要么进度条跳一下，要么直接触发「放完了」去播下一集。
+            snap.frame = None;
+            snap.video_size = None;
+            snap.position = 0.0;
+            snap.duration = 0.0;
+            snap.eof = false;
+            snap.paused = true;
+            snap.audio = false;
+            snap.open_ms = None;
+            snap.media_info = None;
+            snap.fps = 0.0;
+        } else if rodio_active {
             // ---------- 2a. 音频：状态全部问引擎 ----------
             if let Some(e) = &audio_engine {
                 // 解码器报不出时长（没有 Xing 头的 VBR mp3）时保留上一次的值，
