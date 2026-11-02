@@ -129,4 +129,4 @@ powershell -ExecutionPolicy Bypass -File .\package.ps1 0.1.0
 
 ## 许可证
 
-MIT（`LICENSE` 文件还没补，先按 MIT 认）
+[MIT](LICENSE) © 2026 xarzhi
