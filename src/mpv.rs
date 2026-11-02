@@ -276,10 +276,14 @@ impl Mpv {
             ];
 
             if !with_render {
-                // 探测要「安静」：不出声、不动画面、解出头部就够
+                // 探测要「安静」：不出声、不动画面、解出头部就够。
+                //
+                // 这里**不能**再关掉音频（`audio=no`）：纯音频文件本来就只有音轨，
+                // 一关掉 mpv 就既不建轨道也不报 duration，列表里那首歌的时长会
+                // 一直是 `--:--`，而播放这边又拿不到可靠时长。`ao=null` 已经保证
+                // 不出声了，`pause=yes` 也保证它不会真的往后解码。
                 options.push(("ao", "null".into()));
                 options.push(("pause", "yes".into()));
-                options.push(("audio", "no".into()));
             }
 
             for (k, v) in &options {

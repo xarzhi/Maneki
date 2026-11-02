@@ -83,10 +83,24 @@ const PROG_ID: &str = "Maneki.Video";
 const APP_ID: &str = "Maneki";
 
 /// 支持的后缀（跟打开对话框里的过滤器保持一致）
+///
+/// 视频在前、音频在后：注册表里顺序无所谓，「打开方式」候选是按后缀列出来的，
+/// 这个顺序只影响我们自己和用户的阅读。
 pub const EXTS: &[&str] = &[
+    // 视频
     ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".ts", ".m2ts", ".mts", ".rmvb",
-    ".rm", ".m4v", ".mpg", ".mpeg", ".ogv", ".3gp", ".vob", ".asf",
+    ".rm", ".m4v", ".mpg", ".mpeg", ".ogv", ".3gp", ".vob", ".asf", ".mka",
+    // 音频
+    ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".ape", ".aiff",
+    ".aif", ".alac", ".mp2", ".ac3", ".dts",
 ];
+
+/// 关联信息的版本号。
+///
+/// 加后缀、改 ProgID 描述这类「注册内容变了」的改动要把它 +1：
+/// 老用户注册表里是旧的那一套，只有版本号对不上时才会重写一遍。
+/// 否则新加的后缀永远不会被关联上（`is_registered` 只看打开命令，那部分没变）。
+const ASSOC_V: &str = "2";
 
 // ---------------- 注册表小工具 ----------------
 
@@ -282,9 +296,10 @@ pub fn is_registered() -> bool {
     .unwrap_or(false)
 }
 
-/// 启动时调一下：没注册或 exe 挪了位置就重新注册
+/// 启动时调一下：没注册、exe 挪了位置、或者关联表版本变了，就重新注册一遍
 pub fn ensure() {
-    if !is_registered() {
+    let v = get_str(&format!("Software\\{APP_ID}"), "AssocVersion");
+    if !is_registered() || v.as_deref() != Some(ASSOC_V) {
         let _ = register();
     }
 }
@@ -304,7 +319,7 @@ pub fn register() -> Result<(), String> {
 
     // 1. ProgID：类型名 + 图标 + 打开命令
     let prog_path = format!("Software\\Classes\\{PROG_ID}");
-    put(&prog_path, "", "Maneki 视频文件");
+    put(&prog_path, "", "Maneki 媒体文件");
     put(&prog_path, "DefaultIcon", &format!("\"{exe}\",0"));
     put(&format!("{prog_path}\\shell"), "", "open");
     put(&format!("{prog_path}\\shell\\open\\command"), "", &cmd);
@@ -326,7 +341,7 @@ pub fn register() -> Result<(), String> {
     put(
         &cap_path,
         "ApplicationDescription",
-        "轻量级 Rust 视频播放器，秒开、全格式",
+        "轻量级 Rust 视频 / 音频播放器，秒开、全格式",
     );
     put(&cap_path, "ApplicationIcon", &format!("\"{exe}\",0"));
     for ext in EXTS {
@@ -345,6 +360,9 @@ pub fn register() -> Result<(), String> {
     for ext in EXTS {
         put_none(&format!("{app_path}\\SupportedTypes"), ext);
     }
+
+    // 5. 记下这一版关联表 —— 下次启动 `ensure()` 拿它对版本
+    put(&format!("Software\\{APP_ID}"), "AssocVersion", ASSOC_V);
 
     notify_shell();
     Ok(())

@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod assoc;
+mod audio;
 mod icon;
 mod info;
 mod mpv;
@@ -49,6 +50,16 @@ const HIDE_AFTER: Duration = Duration::from_secs(2);
 const PAUSE_ECHO: Duration = Duration::from_millis(300);
 /// 一批拖放要「安静」这么久才算拖完（一次拖多个文件时事件是连着来的）
 const DROP_SETTLE: Duration = Duration::from_millis(120);
+/// ← / → 一次快退 / 快进多少秒
+const SEEK_STEP: f64 = 5.0;
+/// ↑ / ↓ 一次调多少音量（音量刻度是 0~100）
+const VOL_STEP: f64 = 5.0;
+/// 音频舞台中间那块「唱片」的边长
+const ART_SIZE: f32 = 176.0;
+/// 光晕呼吸一圈要几秒
+const AUDIO_PULSE: f32 = 4.2;
+/// 音频舞台的底色：比纯黑亮一档的冷灰，中间那块「唱片」才浮得起来
+const AUDIO_BG: Color = Color::from_rgb(0.043, 0.047, 0.055);
 /// 收起/展开的过渡时间常数（约 0.09s 走完 63%，体感 250ms 左右）
 const ANIM_TAU: f32 = 0.09;
 /// 换片后等这么久还没出画面，才把转圈画出来。
@@ -138,7 +149,7 @@ fn main() -> iced::Result {
     // 命令行开关：注册 / 注销文件关联，做完就退出，不启界面
     match std::env::args().nth(1).as_deref() {
         Some("--register") => {
-            report(assoc::register(), "已注册为视频文件的打开方式。");
+            report(assoc::register(), "已注册为视频 / 音频文件的打开方式。");
             return Ok(());
         }
         Some("--unregister") => {
@@ -212,6 +223,10 @@ enum Message {
     PickedFolder(Option<PathBuf>),
     TogglePlay,
     Seek(f64),
+    /// 方向键 ← / →：快退 / 快进，正数前进
+    Nudge(f64),
+    /// 方向键 ↑ / ↓：调音量，正数增大（0~100 的刻度）
+    NudgeVolume(f64),
     Volume(f64),
     /// 上一集（没有播放列表时退化成后退 10 秒）
     Prev,
@@ -270,7 +285,7 @@ enum Message {
     /// 点抽屉里的某一条
     PlayIndex(usize),
     ClearPlaylist,
-    /// 选一个文件夹，把里面的视频全部装进列表
+    /// 选一个文件夹，把里面的视频和音频全部装进列表
     PickFolder,
 
     // ---- 播放速度 ----
@@ -317,6 +332,8 @@ struct App {
     loading_since: Option<Instant>,
     /// 转圈动画的相位，0..1 一整圈
     spin: f32,
+    /// 音频舞台那圈光晕的相位，0..1 一整圈（播放时慢慢呼吸）
+    pulse: f32,
     paused: bool,
     /// 最近一次「播放 / 暂停」是什么时候发给 mpv 的。
     ///
@@ -445,6 +462,7 @@ impl App {
             frame: None,
             loading_since: None,
             spin: 0.0,
+            pulse: 0.0,
             paused: true,
             pause_sent: None,
             duration: 0.0,
@@ -534,7 +552,7 @@ impl App {
 
     fn play(&mut self, path: PathBuf) {
         let Some(player) = &self.player else {
-            self.error = Some(String::from("播放引擎没加载起来，视频无法播放。"));
+            self.error = Some(String::from("播放引擎没加载起来，无法播放。"));
             return;
         };
 
@@ -607,20 +625,20 @@ impl App {
 
     /// 打开一批路径（文件、文件夹混着都行）。
     ///
-    /// - 单个视频文件：直接播它，列表里就这一条
-    /// - 文件夹 / 一次拖进来好几个：把里面的视频按自然顺序全装进列表，
+    /// - 单个文件：直接播它，列表里就这一条
+    /// - 文件夹 / 一次拖进来好几个：把里面的视频和音频按自然顺序全装进列表，
     ///   先播第一个，同时把右边的抽屉拉开让用户自己挑
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
         let scan = playlist::scan(&paths);
 
-        if scan.videos.is_empty() {
+        if scan.files.is_empty() {
             self.playlist.set(None, Vec::new());
             self.playlist.note = Some(if paths.iter().any(|p| p.is_dir()) {
-                String::from("这个文件夹里没有找到视频文件")
+                String::from("这个文件夹里没有找到视频或音频")
             } else if scan.ignored > 0 {
-                String::from("拖进来的不是视频文件")
+                String::from("拖进来的不是视频或音频文件")
             } else {
-                String::from("这里面没有可以播放的视频")
+                String::from("这里面没有可以播放的文件")
             });
             self.playlist.open = true;
             return;
@@ -633,7 +651,7 @@ impl App {
         self.sized_for_video = false;
 
         if single_file {
-            self.playlist.set(None, scan.videos);
+            self.playlist.set(None, scan.files);
             self.play_index(0);
             self.start_probe();
             return;
@@ -647,7 +665,7 @@ impl App {
             .or_else(|| paths[0].parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| paths[0].clone());
 
-        self.playlist.set(Some(&root), scan.videos);
+        self.playlist.set(Some(&root), scan.files);
         self.playlist.open = true;
         // 抽屉只能开一条：设置 / 字幕浮层这时候都该让位
         self.settings.close();
@@ -764,10 +782,13 @@ impl App {
         // 一条片子都没有（启动后的空白页 / 换片空档）时栏留着：那时候无所谓
         // 「让画面干净点」，而且栏上的打开、设置这些按钮还得能点。
         //
+        // 音频要排除在外：它**永远**没有画面（`frame` 恒为 None），要是照这条
+        // 判，放歌时两条栏就永远收不掉了。
+        //
         // 暂停**不再**特殊对待：以前这里写的是 `!self.playing()`，于是只要暂停，
         // 两条栏就一直挂在上面，鼠标移开窗口也不会收。现在统一成一条规则 ——
         // 静置 2 秒就滑走，暂停也一样。
-        if self.frame.is_none() {
+        if self.frame.is_none() && !self.is_audio() {
             return true;
         }
         // popover / 右键菜单展开时底栏必须留着，否则滑块会跟着一起收走
@@ -813,6 +834,12 @@ impl App {
         if self.loading_since.is_some() || spin_preview() {
             self.spin = (self.spin + dt / spinner::TURN) % 1.0;
         }
+
+        // 音频舞台的光晕：只有真的在放的时候才呼吸。暂停 / 没歌时相位不动，
+        // 那圈光停在半亮的位置，看着是「静」，不是「死了」。
+        if self.is_audio() && !self.paused {
+            self.pulse = (self.pulse + dt / AUDIO_PULSE) % 1.0;
+        }
     }
 
     /// 换片转圈现在的不透明度（0 = 不画，1 = 完全显示）。
@@ -833,7 +860,8 @@ impl App {
         if spin_preview() {
             return 1.0;
         }
-        if self.frame.is_some() || self.error.is_some() || self.current.is_none() {
+        if self.frame.is_some() || self.is_audio() || self.error.is_some() || self.current.is_none()
+        {
             return 0.0;
         }
         let Some(since) = self.loading_since else {
@@ -884,13 +912,57 @@ impl App {
     /// 播放 / 暂停。键盘空格、点画面、点播放键都走这里。
     fn toggle_play(&mut self) {
         self.touch();
-        if self.frame.is_none() {
+        // 音频没有画面（`frame` 永远是 None），所以这里判的是「有没有片子」
+        if self.frame.is_none() && !self.is_audio() {
             return;
         }
         self.paused = !self.paused;
         // 先记时刻再发命令：勾上之后 `tick()` 才不会拿旧快照把按钮翻回去
         self.pause_sent = Some(Instant::now());
         self.send(Cmd::Pause(self.paused));
+    }
+
+    /// 当前这条是不是纯音频（界面画法、加载判断都看它）。
+    fn is_audio(&self) -> bool {
+        self.current.as_ref().is_some_and(|p| audio::is_audio(p))
+    }
+
+    /// ← / → 快退 / 快进。
+    ///
+    /// 时长还没解出来（0）时直接不理：那时候 `position + delta` 夹到哪里都是错的，
+    /// 硬跳会把播放头的解析工作打断，用户还看不到任何反馈。
+    fn nudge(&mut self, delta: f64) {
+        if self.current.is_none() || self.duration <= 0.0 {
+            return;
+        }
+        // 节流：按住 → 时 winit 每 ~30ms 发一次 repeat，全发下去会把
+        // mpv 的 seek 请求堆满（每次都从关键帧重新解码），画面会一顿一顿的。
+        // 60ms 认一次，体感上就是「匀速滑动」。
+        if self
+            .seek_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(60))
+        {
+            return;
+        }
+        self.touch();
+        let t = (self.position + delta).clamp(0.0, self.duration);
+        self.position = t;
+        self.seek_at = Some(Instant::now());
+        self.send(Cmd::Seek(t));
+    }
+
+    /// ↑ / ↓ 调音量，一次 `VOL_STEP`，夹在 0~100。
+    ///
+    /// 已经到头（0 或 100）就不再下发命令 —— 连续按 ↑ 时不该每一下都往
+    /// 播放线程塞一条没用的 `Volume`。
+    fn nudge_volume(&mut self, delta: f64) {
+        self.touch();
+        let v = (self.volume + delta).clamp(0.0, 100.0);
+        if (v - self.volume).abs() < f64::EPSILON {
+            return;
+        }
+        self.volume = v;
+        self.send(Cmd::Volume(v));
     }
 
     // ---------------- 状态同步 ----------------
@@ -918,16 +990,43 @@ impl App {
                     // 首帧到手，转圈可以收了
                     self.loading_since = None;
                 }
-                self.duration = snap.duration;
-                // 正在放的这条自己也知道时长，不用等后台探测（本地文件打开就有）
-                if snap.duration > 0.0
+                if snap.audio {
+                    // 音频没有「首帧」可等：引擎打开就代表加载完了。
+                    // 不在这里清掉，转圈会一直挂在那块唱片上面。
+                    self.loading_since = None;
+                }
+                // 时长：
+                // - 视频：mpv 说了算，报 0 时（还在解析）先用列表里探测到的值顶着
+                // - 音频：**不能用 rodio 报的**。symphonia 对 mp3 的时长是估算的，
+                //   实测一个 42.03 秒的 mp3 报成 46.29 秒（偏长 10%），进度条会
+                //   停在 91% 就结束。探测线程那边是 mpv 读出来的真实时长，
+                //   只要探到了就以它为准；没探到之前先用 rodio 的值顶一下。
+                let probed = self
+                    .playlist
+                    .select
+                    .and_then(|i| self.playlist.items.get(i))
+                    .and_then(|it| it.duration)
+                    .filter(|d| *d > 0.0);
+                self.duration = if snap.audio {
+                    probed.unwrap_or(snap.duration)
+                } else if snap.duration > 0.0 {
+                    snap.duration
+                } else {
+                    probed.unwrap_or(0.0)
+                };
+                // 正在放的这条自己也知道时长，顺手填回列表。
+                // 音频不填：上面说了 rodio 的值偏长，别把列表里的准确值覆盖掉，
+                // 等探测线程来写。
+                if !snap.audio
+                    && snap.duration > 0.0
                     && let Some(i) = self.playlist.select
                 {
                     self.playlist.set_duration(i, Some(snap.duration));
                 }
-                // 没画面（空白页 / 还没出首帧）时不要跟着 mpv 走：
+                // 没画面（空白页 / 还没出首帧）时不要跟着播放器走：
                 // 空闲的 mpv 报告 pause=no，照抄会让空界面上的按钮显示成「暂停」。
-                if self.frame.is_some()
+                // 音频没有画面，但它的 paused 是准的（rodio 的 Sink 说了算），照收。
+                if (self.frame.is_some() || snap.audio)
                     && let Some(p) = self.resolve_paused(snap.paused)
                 {
                     self.paused = p;
@@ -1142,6 +1241,10 @@ impl App {
                     | Message::ToggleVolumePopover
                     | Message::ToggleMute
                     | Message::Tick
+                    // 方向键是「用户在播放器上调」，不算点了别处：
+                    // 尤其 ↑ / ↓ 调音量时，音量 popover 得开着才能看到数字在变
+                    | Message::Nudge(_)
+                    | Message::NudgeVolume(_)
                     // Esc 有自己的一套优先级，交给下面的 match 处理
                     | Message::Escape
                     | Message::MouseMoved(_)
@@ -1166,6 +1269,10 @@ impl App {
                     | Message::PickedSubtitle(_)
                     | Message::RefreshTracks
                     | Message::Tick
+                    // 方向键是「用户在播放器上调」，不算点了别处：
+                    // 尤其 ↑ / ↓ 调音量时，音量 popover 得开着才能看到数字在变
+                    | Message::Nudge(_)
+                    | Message::NudgeVolume(_)
                     // Esc 有自己的一套优先级，交给下面的 match 处理
                     | Message::Escape
                     | Message::MouseMoved(_)
@@ -1186,6 +1293,10 @@ impl App {
                 Message::ToggleSpeedPopover
                     | Message::SetSpeed(_)
                     | Message::Tick
+                    // 方向键是「用户在播放器上调」，不算点了别处：
+                    // 尤其 ↑ / ↓ 调音量时，音量 popover 得开着才能看到数字在变
+                    | Message::Nudge(_)
+                    | Message::NudgeVolume(_)
                     // Esc 有自己的一套优先级，交给下面的 match 处理
                     | Message::Escape
                     | Message::MouseMoved(_)
@@ -1207,6 +1318,10 @@ impl App {
                     | Message::RevealInExplorer
                     | Message::OpenInfo
                     | Message::Tick
+                    // 方向键是「用户在播放器上调」，不算点了别处：
+                    // 尤其 ↑ / ↓ 调音量时，音量 popover 得开着才能看到数字在变
+                    | Message::Nudge(_)
+                    | Message::NudgeVolume(_)
                     // Esc 有自己的一套优先级，交给下面的 match 处理
                     | Message::Escape
                     | Message::MouseMoved(_)
@@ -1234,13 +1349,8 @@ impl App {
                             dialog = dialog.set_directory(dir);
                         }
                         dialog
-                            .add_filter(
-                                "视频",
-                                &[
-                                    "mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "ts",
-                                    "m2ts", "mts", "rmvb", "rm", "m4v", "mpg", "mpeg", "ogv",
-                                ],
-                            )
+                            .add_filter("视频", &playlist::VIDEO_EXTS)
+                            .add_filter("音频", &audio::AUDIO_EXTS)
                             .pick_file()
                             .await
                             .map(|f| f.path().to_path_buf())
@@ -1262,6 +1372,8 @@ impl App {
             }
 
             Message::TogglePlay => self.toggle_play(),
+            Message::Nudge(delta) => self.nudge(delta),
+            Message::NudgeVolume(delta) => self.nudge_volume(delta),
             Message::Seek(secs) => {
                 self.position = secs;
                 self.seek_at = Some(Instant::now());
@@ -1717,15 +1829,32 @@ impl App {
                     Some(Message::MouseEntered)
                 }
                 iced::Event::Mouse(iced::mouse::Event::CursorLeft) => Some(Message::MouseLeft),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key,
-                    repeat: false,
-                    ..
-                }) => match key {
-                    keyboard::Key::Named(keyboard::key::Named::Space) => Some(Message::TogglePlay),
-                    keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::Escape),
-                    _ => None,
-                },
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, repeat, .. }) => {
+                    match key {
+                        // 空格是「切一下」，按住不放会疯狂切，所以只认第一次
+                        keyboard::Key::Named(keyboard::key::Named::Space) if !repeat => {
+                            Some(Message::TogglePlay)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::Escape),
+                        // 方向键：左右跳进度，上下调音量。
+                        // 这几条**故意**连 repeat 一起收：按住 → 应该一路快进，
+                        // 按住 ↑ 应该匀速升音量，这才是播放器该有的手感。
+                        // 进度那边有 60ms 的节流（见 `nudge`），不会把 seek 请求堆满。
+                        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                            Some(Message::Nudge(SEEK_STEP))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                            Some(Message::Nudge(-SEEK_STEP))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                            Some(Message::NudgeVolume(VOL_STEP))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                            Some(Message::NudgeVolume(-VOL_STEP))
+                        }
+                        _ => None,
+                    }
+                }
                 _ => None,
             }),
         ])
@@ -1762,6 +1891,15 @@ impl App {
             // 而左键的按下/松手完全不受影响（pause 照旧走 StagePress/StageRelease）。
             .on_right_press(Message::ContextMenu)
             .into()
+        } else if self.is_audio() {
+            // 纯音频：没有画面可画，给它一块自己的静物界面。
+            // 也要挂上「点一下暂停」—— 音频用户同样习惯点空白处切歌。
+            mouse_area(self.audio_stage())
+                .interaction(mouse::Interaction::Idle)
+                .on_press(Message::StagePress)
+                .on_release(Message::StageRelease)
+                .on_right_press(Message::ContextMenu)
+                .into()
         } else if self.current.is_some() || spin_preview() {
             // 换片空档：这一条已经在开了，但首帧还没到。
             // 圈出现之前先留一块纯黑 —— 不然会闪一下下面的「把视频拖进来」空白页，
@@ -1790,11 +1928,11 @@ impl App {
                     ))
                     .width(Length::Fixed(LOGO_HERO))
                     .height(Length::Fixed(LOGO_HERO)),
-                    text("把视频或文件夹拖进来")
+                    text("把视频、音频或文件夹拖进来")
                         .font(icon::UI_FONT)
                         .size(20)
                         .color(icon::TEXT_DIM),
-                    text("拖文件夹会把里面的视频全部排进播放列表")
+                    text("拖文件夹会把里面的视频和音频全部排进播放列表")
                         .font(icon::UI_FONT)
                         .size(14)
                         .color(icon::TEXT_FAINT),
@@ -1973,6 +2111,83 @@ impl App {
             .height(Fill)
             .style(black_style)
             .into()
+    }
+
+    /// 纯音频的舞台：中间一块「唱片」+ 文件名 + 状态。
+    ///
+    /// 音频没有画面，走不到上面那条 shader 分支；这里给一块安静的界面顶上。
+    /// 播放时方块外面那圈光会缓慢呼吸（相位在 `animate` 里推进），暂停就停住 ——
+    /// 「在放」和「停着」不用看按钮也能一眼分出来。
+    fn audio_stage(&self) -> Element<'_, Message> {
+        // 0..1 之间正弦来回走。暂停时固定在 0.5，留一点微光，别整个死掉
+        let breath = if self.paused {
+            0.5
+        } else {
+            0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin()
+        };
+        let glow = 0.04 + 0.09 * breath;
+
+        let art = container(
+            iced::widget::image(iced::widget::image::Handle::from_rgba(
+                LOGO_BIG_SRC,
+                LOGO_BIG_SRC,
+                LOGO_BIG_RGBA,
+            ))
+            .width(Length::Fixed(96.0))
+            .height(Length::Fixed(96.0)),
+        )
+        .width(Length::Fixed(ART_SIZE))
+        .height(Length::Fixed(ART_SIZE))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.10, 0.11, 0.13))),
+            border: Border {
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.07),
+                width: 1.0,
+                radius: 26.0.into(),
+            },
+            // 用「模糊的白影」当光晕：iced 没有径向渐变，这层柔光是代价最小
+            // 又最接近的做法，呼吸起来也不突兀。
+            shadow: Shadow {
+                color: Color::from_rgba(1.0, 1.0, 1.0, glow),
+                offset: Vector::ZERO,
+                blur_radius: 46.0,
+            },
+            ..container::Style::default()
+        });
+
+        // 音频文件名常常是「歌手 - 歌名 - 专辑」一长串，按窗口宽度截断
+        let budget = (self.win_size.width - 160.0).clamp(160.0, 620.0);
+        let ext = self
+            .current
+            .as_ref()
+            .and_then(|p| p.extension())
+            .map(|e| e.to_string_lossy().to_uppercase())
+            .unwrap_or_else(|| String::from("AUDIO"));
+        let state = if self.paused { "已暂停" } else { "正在播放" };
+
+        container(
+            column![
+                art,
+                text(ui::elide(&self.title, budget, 21.0))
+                    .font(icon::UI_BOLD)
+                    .size(21.0)
+                    .color(icon::TEXT),
+                text(format!("{ext} · {state}"))
+                    .font(icon::UI_FONT)
+                    .size(13.0)
+                    .color(icon::TEXT_FAINT),
+            ]
+            .spacing(24)
+            .align_x(Alignment::Center),
+        )
+        .center(Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(AUDIO_BG)),
+            ..container::Style::default()
+        })
+        .into()
     }
 
     fn error_panel<'a>(&'a self, err: &'a str) -> Element<'a, Message> {
@@ -3139,7 +3354,7 @@ mod tests {
         assert!(app.playlist.open, "什么都没找到也要把抽屉打开说明原因");
         assert_eq!(
             app.playlist.note.as_deref(),
-            Some("这个文件夹里没有找到视频文件")
+            Some("这个文件夹里没有找到视频或音频")
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3481,5 +3696,97 @@ mod tests {
         }
         // 每帧 1/60 秒，转一圈 0.9 秒 = 54 帧，走 56 帧应该已经绕回来了
         assert!(app.spin < 0.2, "绕一圈之后没有回卷：{}", app.spin);
+    }
+
+    // ---------------- 方向键 ----------------
+
+    /// 造一个「正在放 60 秒的片子、停在 10 秒」的 App
+    fn playing_at(secs: f64) -> App {
+        let mut app = app();
+        app.current = Some(PathBuf::from(r"C:\a\b\movie.mkv"));
+        app.duration = 60.0;
+        app.position = secs;
+        app.paused = false;
+        app
+    }
+
+    #[test]
+    fn arrow_keys_seek_five_seconds_and_stop_at_the_ends() {
+        let mut app = playing_at(10.0);
+
+        let _ = app.update(Message::Nudge(SEEK_STEP));
+        assert_eq!(app.position, 15.0, "→ 应该快进 5 秒");
+
+        // 一路快进到结尾：夹在时长上，不越界
+        app.seek_at = None;
+        let _ = app.update(Message::Nudge(SEEK_STEP * 100.0));
+        assert_eq!(app.position, 60.0, "快进不能超过总时长");
+
+        app.seek_at = None;
+        let _ = app.update(Message::Nudge(-SEEK_STEP * 100.0));
+        assert_eq!(app.position, 0.0, "后退不能变成负数");
+    }
+
+    #[test]
+    fn holding_an_arrow_is_throttled() {
+        let mut app = playing_at(10.0);
+
+        let _ = app.update(Message::Nudge(SEEK_STEP));
+        assert_eq!(app.position, 15.0);
+
+        // 60ms 之内的 repeat（按住不放时 winit 每 ~30ms 发一次）必须丢掉
+        let _ = app.update(Message::Nudge(SEEK_STEP));
+        assert_eq!(app.position, 15.0, "60ms 内的连发要被节流掉");
+
+        // 过了节流窗口就正常认
+        app.seek_at = Some(Instant::now() - Duration::from_millis(80));
+        let _ = app.update(Message::Nudge(SEEK_STEP));
+        assert_eq!(app.position, 20.0);
+    }
+
+    #[test]
+    fn arrow_keys_move_volume_by_five() {
+        let mut app = app();
+        app.volume = 50.0;
+
+        let _ = app.update(Message::NudgeVolume(VOL_STEP));
+        assert_eq!(app.volume, 55.0, "↑ 应该加 5");
+
+        let _ = app.update(Message::NudgeVolume(-VOL_STEP));
+        assert_eq!(app.volume, 50.0, "↓ 应该减 5");
+
+        let _ = app.update(Message::NudgeVolume(-VOL_STEP * 100.0));
+        assert_eq!(app.volume, 0.0, "音量不能低于 0");
+
+        let _ = app.update(Message::NudgeVolume(VOL_STEP * 100.0));
+        assert_eq!(app.volume, 100.0, "音量不能高于 100");
+    }
+
+    // ---------------- 音频 ----------------
+
+    #[test]
+    fn bars_hide_for_audio_even_though_there_is_no_frame() {
+        let mut app = app();
+        app.current = Some(PathBuf::from(r"C:\a\b\song.mp3"));
+        app.frame = None;
+        assert!(app.is_audio(), "mp3 应该被认成音频");
+
+        app.cursor = Some(Point::new(400.0, 300.0));
+        app.last_active = Instant::now() - HIDE_AFTER - Duration::from_millis(50);
+        assert!(!app.want_bars(), "放音频时静置也要收栏");
+    }
+
+    #[test]
+    fn space_toggles_audio_without_a_picture() {
+        let mut app = app();
+        app.current = Some(PathBuf::from(r"C:\a\b\song.mp3"));
+        app.frame = None;
+        app.paused = false;
+
+        let _ = app.update(Message::TogglePlay);
+        assert!(app.paused, "音频没有 frame 也要能切暂停");
+
+        let _ = app.update(Message::TogglePlay);
+        assert!(!app.paused, "再按一次要能恢复");
     }
 }

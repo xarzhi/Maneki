@@ -51,7 +51,7 @@ const DUR_W: f32 = 46.0;
 /// 名字 / 子目录能用的横向像素：
 /// 面板宽 - 左右内边距 - 竖条 - 竖条到序号的间距 - 序号 - 两处行距 - 时长
 const NAME_W: f32 = W - ROW_PAD_L - ROW_PAD_R - 3.0 - NUM_GAP - NUM_W - 2.0 * ROW_GAP - DUR_W;
-/// 一个文件夹最多收多少个视频（误拖 `C:\` 时不至于把界面搞崩）
+/// 一个文件夹最多收多少项（误拖 `C:\` 时不至于把界面搞崩）
 const MAX_FILES: usize = 4000;
 /// 子目录最多往下钻几层（剧集一般「剧名\第1季\」两层就够）
 const MAX_DEPTH: usize = 5;
@@ -60,7 +60,7 @@ const MAX_DEPTH: usize = 5;
 ///
 /// 只影响「扫目录时算不算视频」，真的解码还是 libmpv 说了算，
 /// 所以这里宁宽勿窄 —— 少收一个格式用户会以为程序不支持。
-const VIDEO_EXTS: &[&str] = &[
+pub const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "ts", "m2ts", "mts", "m2t", "tp", "trp",
     "rmvb", "rm", "m4v", "mpg", "mpeg", "mpe", "ogv", "ogm", "3gp", "3g2", "asf", "vob", "divx",
     "f4v", "mxf", "dv", "wtv", "nut", "y4m", "amv", "mod", "m1v", "m2v", "mpv",
@@ -76,37 +76,48 @@ pub fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 能进播放列表的任意媒体：视频 + 音频。
+///
+/// 音频的扩展名表放在 `audio` 模块里 —— 那里的两张表（能不能解 / 走哪个后端）
+/// 得和这里一致，分散在两地迟早对不上。
+pub fn is_media(path: &Path) -> bool {
+    is_video(path) || crate::audio::is_audio(path)
+}
+
 // ---------------- 扫描 ----------------
 
 /// 一次扫描的结果
 pub struct Scan {
-    pub videos: Vec<PathBuf>,
-    /// 用户拖进来几个「不是视频的文件」
+    /// 视频和音频混在一张表里（按路径自然顺序排）
+    pub files: Vec<PathBuf>,
+    /// 用户拖进来几个「不是媒体文件」的
     pub ignored: usize,
 }
 
-/// 把一串路径（文件 / 文件夹混杂）摊平成视频列表。
+/// 把一串路径（文件 / 文件夹混杂）摊平成可播放列表。
 ///
 /// 文件夹递归扫描，按自然顺序排；重复的路径会去重（同一个文件拖两次）。
+/// 视频和音频**不分家**：一个文件夹里既有剧集又有 ost 时，用户要的是
+/// 「这个文件夹里的东西按顺序都能放」，而不是分成两个列表。
 pub fn scan(inputs: &[PathBuf]) -> Scan {
-    let mut videos = Vec::new();
+    let mut files = Vec::new();
     let mut ignored = 0usize;
 
     for p in inputs {
         if p.is_dir() {
-            walk(p, 0, &mut videos);
-        } else if is_video(p) {
-            videos.push(p.clone());
+            walk(p, 0, &mut files);
+        } else if is_media(p) {
+            files.push(p.clone());
         } else {
             ignored += 1;
         }
     }
 
-    videos.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
-    videos.dedup();
-    videos.truncate(MAX_FILES);
+    files.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+    files.dedup();
+    files.truncate(MAX_FILES);
 
-    Scan { videos, ignored }
+    Scan { files, ignored }
 }
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -131,7 +142,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
                 continue;
             }
             walk(&entry.path(), depth + 1, out);
-        } else if is_video(&entry.path()) {
+        } else if is_media(&entry.path()) {
             out.push(entry.path());
         }
     }
@@ -206,9 +217,9 @@ pub struct Playlist {
     pub items: Vec<Item>,
     /// 正在播第几条（不在列表里就是 None）
     pub select: Option<usize>,
-    /// 抽屉头里的说明：「4K 合集 · 24 个视频」
+    /// 抽屉头里的说明：「4K 合集 · 24 项」
     pub title: String,
-    /// 空列表时的解释（比如「这个文件夹里没有视频」）
+    /// 空列表时的解释（比如「这个文件夹里没有视频或音频」）
     pub note: Option<String>,
 }
 
@@ -245,9 +256,9 @@ impl Playlist {
         self.title = {
             let count = items.len();
             match source.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()) {
-                Some(dir) => format!("{dir} · {count} 个视频"),
-                None if count == 1 => String::from("1 个视频"),
-                None => format!("{count} 个视频"),
+                Some(dir) => format!("{dir} · {count} 项"),
+                None if count == 1 => String::from("1 项"),
+                None => format!("{count} 项"),
             }
         };
         self.items = items;
@@ -532,7 +543,7 @@ fn empty_state<'a>(p: &'a Playlist) -> Element<'a, Message> {
     let hint = p
         .note
         .clone()
-        .unwrap_or_else(|| String::from("把视频文件或文件夹拖进窗口，就会出现在这里"));
+        .unwrap_or_else(|| String::from("把视频、音频或文件夹拖进窗口，就会出现在这里"));
 
     container(
         column![
@@ -563,8 +574,8 @@ fn footer<'a>(count: usize, known: Option<f64>) -> Element<'a, Message> {
     // 全列表时长已知时才报总时长：探测是后台一条条补的，
     // 半路显示一个「已经统计到的合计」会让人以为文件时长不对。
     let summary = match known {
-        Some(secs) if count > 1 => format!("{count} 个视频 · 共 {}", fmt_dur(Some(secs))),
-        _ => format!("{count} 个视频"),
+        Some(secs) if count > 1 => format!("{count} 项 · 共 {}", fmt_dur(Some(secs))),
+        _ => format!("{count} 项"),
     };
 
     container(
@@ -708,5 +719,42 @@ mod tests {
     fn extension_check_is_case_insensitive() {
         assert!(is_video(Path::new(r"C:\a\b\Movie.MKV")));
         assert!(!is_video(Path::new(r"C:\a\b\readme.txt")));
+    }
+
+    #[test]
+    fn audio_counts_as_playable_media() {
+        assert!(is_media(Path::new(r"C:\a\b\song.mp3")));
+        assert!(is_media(Path::new(r"C:\a\b\ALBUM.FLAC")));
+        assert!(is_media(Path::new(r"C:\a\b\movie.mkv")));
+        // 音频文件不该被当成视频
+        assert!(!is_video(Path::new(r"C:\a\b\song.mp3")));
+        assert!(!is_media(Path::new(r"C:\a\b\cover.jpg")));
+        assert!(!is_media(Path::new(r"C:\a\b\notes.txt")));
+    }
+
+    /// 真的造一个目录扫一遍：视频和音频都要进来，图片和文本要被挡在外面。
+    #[test]
+    fn folder_scan_collects_audio_alongside_video() {
+        let root = std::env::temp_dir().join(format!("maneki-scan-{}", std::process::id()));
+        let sub = root.join("ost");
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in ["b.mp4", "a.mp3", "c.txt"] {
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        for f in ["d.flac", "e.jpg"] {
+            std::fs::write(sub.join(f), b"x").unwrap();
+        }
+
+        let scan = scan(&[root.clone()]);
+        let names: Vec<String> = scan
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(names, vec!["a.mp3", "b.mp4", "d.flac"]);
+        assert_eq!(scan.ignored, 0, "拖的是文件夹，里面的非媒体文件不该算「拖错了」");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -1,15 +1,26 @@
 # Maneki
 
-**用 Rust + iced 写的 Windows 视频播放器**，解码交给 libmpv。
+**用 Rust + iced 写的 Windows 视频播放器**
 
-就冲两件事去的：**几十 GB 的片子也秒开**，以及拖窗口、拉缩放的时候画面不停。
+![image-20261102190026746](https://gitee.com/xarzhi/picture/raw/master/img/image-20261102190026746.png)
 
-名字取自招财猫（maneki-neko）——举爪那一下，正好是「点一下播放」。
-和 [Meow Player](https://github.com/xarzhi/meow-player)（本地音乐播放器）是一对：一个是猫叫，一个是猫的样子。
+## 页面展示
 
-![界面](assets/screenshot.png)
+### 常规页面
 
-*截图里放的是 FFmpeg 的彩条测试片（`assets/sample.mp4`），右侧是播放列表抽屉。*
+![PixPin_2026-11-02_18-43-18](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-43-18.png)
+
+### 播放界面
+
+![PixPin_2026-11-02_18-46-37](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-46-37.png)
+
+### 播放列表
+
+![PixPin_2026-11-02_18-51-49](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-51-49.png)
+
+### 干净的播放窗口
+
+![PixPin_2026-11-02_18-48-56](https://gitee.com/xarzhi/picture/raw/master/img/PixPin_2026-11-02_18-48-56.png)
 
 ## 特性
 
@@ -20,6 +31,7 @@
 - 换片空档在画面中央转一圈，首帧到手立刻收（秒开的小文件不会闪）
 - 播放速度 0.5×–8.0×，预设 + 自定义滑杆，连播时保持不变
 - 音量、字幕、速度三块浮层都从底栏上方弹出
+- 音频用 rodio 直接送声卡，界面换成一块「唱片」：播放时光晕缓慢呼吸，暂停就停住
 
 **画面**
 
@@ -62,13 +74,26 @@
 | 键 | 作用 |
 | --- | --- |
 | `Space` | 播放 / 暂停 |
+| `→` / `←` | 快进 / 快退 5 秒（按住不放会连续走，60ms 节流一次） |
+| `↑` / `↓` | 音量 +5 / -5（0–100） |
 | `Esc` | 逐层收起：右键菜单 → 浮层 → 抽屉 → 退出全屏 |
 
 ## 支持的格式
 
+**视频**（libmpv 解码）
+
 `mp4` `mkv` `avi` `mov` `flv` `wmv` `webm` `ts` `m2ts` `mts` `rmvb` `rm` `m4v` `mpg` `mpeg` `ogv` `3gp` `vob` `asf`
 
-实际能不能放，最终取决于你的 libmpv 里那份 FFmpeg 构建。
+**音频**
+
+- 走 rodio（symphonia / claxon / hound / lewton）：`mp3` `flac` `wav` `ogg` `m4a` `aac`
+- 上面这些 rodio 解不了的，自动回退给 libmpv：`wma` `ape` `opus` `mka` `mp2` `ac3` `dts` …
+- 拖文件夹时音频和视频一起收进列表，按文件名自然排序，放完照样能自动接下一首
+
+实际能不能放，最终取决于你的 libmpv 里那份 FFmpeg 构建（音频那几种要看 rodio 的）。
+
+音频用 rodio 而不是也交给 mpv：放一首歌不该占着一份 1080p 的软件渲染缓冲，
+从 WASAPI 直接送采样，内存只有解码器那点缓冲，暂停 / 拖动也不用绕一层属性系统。
 
 ## 环境
 
@@ -109,7 +134,8 @@ powershell -ExecutionPolicy Bypass -File .\package.ps1 0.1.0
 | --- | --- |
 | `main.rs` | 应用状态、消息、视图与布局 |
 | `mpv.rs` | libmpv 的最小 FFI 封装，以及上面那批启动选项 |
-| `player.rs` | 播放线程：解码、取帧、回报状态快照 |
+| `player.rs` | 播放线程：解码、取帧、回报状态快照；视频走 libmpv，音频走 rodio |
+| `audio.rs` | 纯音频播放（rodio）：打开 / 暂停 / 跳转 / 音量 / 倍速，以及音频后缀表 |
 | `video.rs` | 上屏：把一帧 RGBA 当纹理采样画出来，附带填充 / 比例 / 调色 |
 | `playlist.rs` | 目录扫描、自然排序、播放列表抽屉 |
 | `settings.rs` | 设置抽屉 |
@@ -126,6 +152,8 @@ powershell -ExecutionPolicy Bypass -File .\package.ps1 0.1.0
 - 只有 Windows：`win32.rs` 里全是原生调用，没有做跨平台抽象
 - 字幕只走 libmpv 自己的渲染，样式不可调
 - **不能切音轨**：多音轨的片子目前只能用 libmpv 挑的第一条（字幕可以选，音轨还没做）
+- 音频的时长以后台探测（libmpv）为准：rodio 对 mp3 的时长是**估算**的，实测 42 秒的
+  mp3 会报成 46 秒；探测值没回来之前先用它顶着，回来后立刻换掉
 
 ## 许可证
 
