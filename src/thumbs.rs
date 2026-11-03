@@ -35,6 +35,13 @@ use std::time::{Duration, Instant};
 
 use crate::mpv::Mpv;
 
+/// 和 `eprintln!` 一样的用法，但同时落盘
+macro_rules! tlog {
+    ($($arg:tt)*) => {
+        log(format_args!($($arg)*))
+    };
+}
+
 /// 一张缩略图的宽度（高度按视频比例算，见 [`thumb_height`]）
 pub const W: u32 = 160;
 /// 时间轴分桶的粒度。2 秒一格：一小时也就 1800 格，够密了。
@@ -236,9 +243,12 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>, epoch: Arc<At
         // 记下这一刻的「用户要过几次」。抽到一半他又挪了，这个数就不再相等，
         // 说明手上这张已经没人要了，立刻让路。
         let my = epoch.load(Ordering::Relaxed);
-        if log_enabled() {
-            eprintln!("thumb job: bucket={} t={:.1} {}", job.key.1, job.at, job.path.display());
-        }
+        tlog!(
+            "thumb job: bucket={} t={:.1} {}",
+            job.key.1,
+            job.at,
+            job.path.display()
+        );
 
         if mpv.is_none() {
             match Mpv::frames() {
@@ -264,19 +274,17 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>, epoch: Arc<At
                 size = video_size(m);
                 loaded = Some(path_str.clone());
             }
-            if log_enabled() {
-                eprintln!(
-                    "thumb open: {} dur={:?} 尺寸 {}x{} 像素格式={:?} primaries={:?} gamma={:?} hdr={:?}",
-                    if opened.is_some() { "成功" } else { "失败" },
-                    opened,
-                    size.0,
-                    size.1,
-                    m.get_string("video-params/pixelformat"),
-                    m.get_string("video-params/primaries"),
-                    m.get_string("video-params/gamma"),
-                    m.get_string("video-params/sig-peak"),
-                );
-            }
+            tlog!(
+                "thumb open: {} dur={:?} 尺寸 {}x{} 像素格式={:?} primaries={:?} gamma={:?} hdr={:?}",
+                if opened.is_some() { "成功" } else { "失败" },
+                opened,
+                size.0,
+                size.1,
+                m.get_string("video-params/pixelformat"),
+                m.get_string("video-params/primaries"),
+                m.get_string("video-params/gamma"),
+                m.get_string("video-params/sig-peak"),
+            );
         }
         if loaded.is_none() {
             continue;
@@ -307,8 +315,8 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>, epoch: Arc<At
             let pos = m.get_f64("time-pos").unwrap_or(-1.0);
             let off = (pos - job.at).abs();
             let exact_enough = off <= 0.4;
-            if log_enabled() && !exact_enough {
-                eprintln!("thumb 关键帧偏差 {off:.2}s（t={:.1} 落在 {pos:.2}）", job.at);
+            if !exact_enough {
+                tlog!("thumb 关键帧偏差 {off:.2}s（t={:.1} 落在 {pos:.2}）", job.at);
             }
 
             // 队列里还压着新请求 = 用户还在扫，别精修了，先把他要看的那格给他
@@ -423,9 +431,7 @@ fn grab(
         std::thread::sleep(Duration::from_millis(4));
     }
     if !arrived {
-        if log_enabled() {
-            eprintln!("thumb 寻址超时: t={:.1} 当前位置 {:?}", job.at, m.get_f64("time-pos"));
-        }
+        tlog!("thumb 寻址超时: t={:.1} 当前位置 {:?}", job.at, m.get_f64("time-pos"));
         return None;
     }
 
@@ -436,9 +442,7 @@ fn grab(
             return None;
         }
         if Instant::now() >= deadline {
-            if log_enabled() {
-                eprintln!("thumb 等画面超时: t={:.1} 黑帧 {}", job.at, blanks);
-            }
+            tlog!("thumb 等画面超时: t={:.1} 黑帧 {}", job.at, blanks);
             return None;
         }
         if !m.render_into(&mut buf, W, th) {
@@ -452,9 +456,7 @@ fn grab(
         // 真·全黑的画面等多久都是黑的。
         blanks += 1;
         if blanks >= BLANK_TRIES {
-            if log_enabled() {
-                eprintln!("thumb 放弃: t={:.1} 连续 {} 帧纯黑", job.at, blanks);
-            }
+            tlog!("thumb 放弃: t={:.1} 连续 {} 帧纯黑", job.at, blanks);
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -464,16 +466,14 @@ fn grab(
     for px in buf.chunks_exact_mut(4) {
         px[3] = 255;
     }
-    if log_enabled() {
-        eprintln!(
-            "thumb ok: t={:.1} {:?} 用时 {}ms 平均亮度 {:.1} pos={:?}",
-            job.at,
-            how,
-            start.elapsed().as_millis(),
-            mean(&buf),
-            m.get_f64("time-pos"),
-        );
-    }
+    tlog!(
+        "thumb ok: t={:.1} {:?} 用时 {}ms 平均亮度 {:.1} pos={:?}",
+        job.at,
+        how,
+        start.elapsed().as_millis(),
+        mean(&buf),
+        m.get_f64("time-pos"),
+    );
     Some(Shot {
         key: job.key.clone(),
         w: W,
@@ -511,9 +511,40 @@ fn mean(rgba: &[u8]) -> f64 {
     sum as f64 / (n * 3) as f64
 }
 
-/// `QP_THUMB_LOG=1` 时把抽帧情况打到 stderr，排查「预览是黑的」用。
+/// `QP_THUMB_LOG=1` 时把抽帧情况记下来，排查「预览是黑的 / 太慢」用。
+///
+/// 除了 stderr 还会写一份到 `%TEMP%\maneki-thumbs.log`：这是个 GUI 程序，
+/// 双击运行的时候根本没有控制台，stderr 等于扔了。带时间戳的日志是唯一能
+/// 事后看清「哪一格花了多久」的东西。
 fn log_enabled() -> bool {
     std::env::var_os("QP_THUMB_LOG").is_some()
+}
+
+/// 日志文件句柄。第一次记的时候打开（截断），之后一直追加。
+static LOG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+/// 进程启动时刻，日志里的相对毫秒都从这儿算
+static LOG_T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn log(args: std::fmt::Arguments<'_>) {
+    if !log_enabled() {
+        return;
+    }
+    let ms = LOG_T0.get_or_init(Instant::now).elapsed().as_millis();
+    eprintln!("[{ms:>6}] {args}");
+    let mut slot = match LOG.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if slot.is_none() {
+        let dir = std::env::var_os("TEMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        *slot = std::fs::File::create(dir.join("maneki-thumbs.log")).ok();
+    }
+    if let Some(f) = slot.as_mut() {
+        use std::io::Write;
+        let _ = writeln!(f, "[{ms:>6}] {args}");
+    }
 }
 
 #[cfg(test)]

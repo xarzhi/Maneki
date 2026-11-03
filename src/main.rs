@@ -594,6 +594,10 @@ struct App {
     /// 已经在排队等的那一格。tick 是 60Hz，不挡一下的话同一格会一秒发 60 条请求，
     /// 线程那边刚 seek 完又被灌满，永远在重复同一件事。
     thumb_asked: Option<thumbs::Key>,
+    /// 上一次发请求的时间。移动时要按这个节流，**不能**按「停多久」算 ——
+    /// 手一直在动的时候，`since` 每帧都在刷新，一个请求都发不出去，
+    /// 表现就是「扫过去图不跟着变，停下才变」。
+    thumb_sent: Option<Instant>,
 }
 
 /// 一张缩略图：除了 iced 的贴图句柄，还记着像素尺寸（摆浮层要算居中）
@@ -609,9 +613,6 @@ struct Thumb {
 struct BarHover {
     ratio: f32,
     bucket: i64,
-    /// 停到这一刻为止。要停够 `THUMB_DWELL` 才真的去抽帧 ——
-    /// 手扫过进度条时不该疯狂解码。
-    since: Instant,
 }
 
 /// 拖边缘缩放时的起始快照，全部是物理像素（屏幕坐标）
@@ -740,6 +741,7 @@ impl App {
             thumb_last: None,
             bar_hover: None,
             thumb_asked: None,
+            thumb_sent: None,
         };
 
         if let Some(p) = &app.player {
@@ -1417,12 +1419,12 @@ impl App {
     /// "1:02:05" 差十几个像素），滑块的位置就飘了，预览会比光标慢半拍。
     const TIME_W: f32 = 54.0;
 
-    /// 鼠标停多久才真的去抽帧。太短的话手一扫就解一堆没人看的帧。
+    /// 两次请求之间至少隔这么久。抽一张要 140ms 上下，再密也只是往队列里堆
+    /// 没人看的格；90ms 差不多能跟住手扫过去的速度。
     ///
-    /// 计时是从**最后一次移动**算起的，所以手一直在扫的时候一个请求都不会发；
-    /// 80ms 大概就是「手停了」和「只是抖了一下」的分界。抽一张要 140ms
-    /// （关键帧那张），两者加起来才两百多毫秒，再短就没意义了。
-    const THUMB_DWELL: Duration = Duration::from_millis(80);
+    /// 注意它**不是**「停多久才抽」：手一直动的时候也要换图，不然扫过去
+    /// 预览是死的。
+    const THUMB_THROTTLE: Duration = Duration::from_millis(90);
     /// 缓存上限。一格 160×90×4 ≈ 56KB，160 张不到 9MB。
     const THUMB_MAX: usize = 160;
 
@@ -1445,7 +1447,6 @@ impl App {
         Some(BarHover {
             ratio,
             bucket: thumbs::bucket_of(t),
-            since: Instant::now(),
         })
     }
 
@@ -1508,13 +1509,21 @@ impl App {
             return;
         }
 
-        // 停够了才去抽；同一格只发一次，别每帧都塞一遍
-        if hover.since.elapsed() >= Self::THUMB_DWELL
-            && self.thumb_asked.as_ref() != Some(&key)
-            && let Some(t) = &self.thumbs
-        {
+        // 每隔一小段才发一次，同一格只发一次。
+        //
+        // 这里刻意**不看**「鼠标停多久」：手一直在动的时候那个计时每帧都在归零，
+        // 于是一个请求都发不出去，扫过去图根本不跟着变，要停下才跳一张 ——
+        // 用户说的「换得太慢」就是这个。改成按「距上次请求多久」节流，
+        // 手在扫的时候也会每 90ms 换一张最新的。
+        let due = self
+            .thumb_sent
+            .is_none_or(|t| t.elapsed() >= Self::THUMB_THROTTLE);
+        if due && self.thumb_asked.as_ref() != Some(&key) {
             self.thumb_asked = Some(key);
-            t.want(&path, hover.bucket);
+            self.thumb_sent = Some(Instant::now());
+            if let Some(t) = &self.thumbs {
+                t.want(&path, hover.bucket);
+            }
         }
     }
 
@@ -6042,25 +6051,36 @@ mod tests {
         assert!(app.bar_hover_at(Point::new(600.0, 13.0)).is_some());
     }
 
-    /// 光标停在同一个格子上一遍遍报回来，不该反复让线程去抽帧。
+    /// 手在扫的时候也要出图：节流按「距上次请求多久」算，不是「停多久」。
     #[test]
-    fn hover_only_asks_once_after_the_dwell() {
+    fn hover_asks_while_the_mouse_is_still_moving() {
         let mut app = app();
-        app.duration = 60.0;
+        app.duration = 600.0;
         app.bars = 1.0;
         app.current = Some(PathBuf::from(r"C://a//b//movie.mp4"));
+
+        // 第一下（光标刚进来）：立刻就要
         app.bar_hover = app.bar_hover_at(Point::new(600.0, 13.0));
-
-        // 还没停够：什么都不做（缓存也没有）
         app.tick_thumbs();
-        assert!(app.thumb_cache.is_empty());
+        let first = app.thumb_asked.clone().expect("第一下就该发请求");
 
-        // 停够了：请求发出去（线程有没有真抽到不在这里验）
-        if let Some(h) = app.bar_hover.as_mut() {
-            h.since = Instant::now() - App::THUMB_DWELL - Duration::from_millis(10);
-        }
+        // 光标挪到别处（换了格子），但还没到节流窗口：不该再发
+        app.bar_hover = app.bar_hover_at(Point::new(900.0, 13.0));
         app.tick_thumbs();
-        // 结果要等线程回话，这一帧肯定还空着
-        assert!(app.thumb_cache.is_empty(), "抽帧是异步的，不该同步就有图");
+        assert_eq!(app.thumb_asked.as_ref(), Some(&first), "节流窗口内不该再发请求");
+
+        // 窗口过了：换新格子就该发出去 —— 关键是这里**没有**停下来等
+        app.thumb_sent = Some(Instant::now() - App::THUMB_THROTTLE - Duration::from_millis(5));
+        app.tick_thumbs();
+        assert_ne!(app.thumb_asked, Some(first.clone()), "节流过了还在扫，就该换下一格");
+
+        // 同一格上反复 tick 不会重复发
+        let now = app.thumb_asked.clone();
+        app.thumb_sent = Some(Instant::now() - App::THUMB_THROTTLE - Duration::from_millis(5));
+        app.tick_thumbs();
+        assert_eq!(app.thumb_asked, now, "同一格不该反复要");
+
+        // 缓存里已经有了就不再发
+        assert!(app.thumb_cache.is_empty(), "抽帧是异步的，这一帧不该有图");
     }
 }
