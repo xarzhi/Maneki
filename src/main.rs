@@ -7,6 +7,7 @@ mod audio;
 mod hide_cursor;
 mod icon;
 mod info;
+mod keys;
 mod meta;
 mod mpv;
 mod player;
@@ -16,7 +17,9 @@ mod settings;
 mod single;
 mod spinner;
 mod spring;
+mod state;
 mod subtitle;
+mod thumbs;
 mod ui;
 mod video;
 mod win32;
@@ -27,7 +30,7 @@ use iced::widget::{
 };
 use iced::window::Direction;
 use iced::{
-    keyboard, mouse, Alignment, Background, Border, Color, Element, Fill, Length, Padding, Point,
+    mouse, Alignment, Background, Border, Color, Element, Fill, Length, Padding, Point,
     Rectangle, Shadow, Size, Subscription, Task, Theme, Vector,
 };
 use std::path::PathBuf;
@@ -38,6 +41,8 @@ use hide_cursor::HideCursor;
 use player::{Cmd, Player};
 use playlist::Playlist;
 use settings::{Field, Settings, Tab};
+use state::State;
+use thumbs::Thumbs;
 use video::{Aspect, FitMode, VideoProgram};
 
 /// 顶栏高度
@@ -46,6 +51,8 @@ const TOP_H: f32 = 38.0;
 const BOTTOM_H: f32 = 96.0;
 /// 鼠标静止多久后自动收起
 const HIDE_AFTER: Duration = Duration::from_secs(2);
+/// 底部短提示（「已保存：xxx.png」）停留多久
+const NOTICE_LIFE: Duration = Duration::from_millis(2600);
 /// 点完播放/暂停之后，最多容忍 mpv 多久还没「回声」。
 ///
 /// 正常情况下播放线程几毫秒就追上来了，这个值只是兜底：万一 mpv 不认这条命令
@@ -54,8 +61,8 @@ const HIDE_AFTER: Duration = Duration::from_secs(2);
 const PAUSE_ECHO: Duration = Duration::from_millis(300);
 /// 一批拖放要「安静」这么久才算拖完（一次拖多个文件时事件是连着来的）
 const DROP_SETTLE: Duration = Duration::from_millis(120);
-/// ← / → 一次快退 / 快进多少秒
-const SEEK_STEP: f64 = 5.0;
+// ← / → / J / L 的步长放在 `keys.rs` 里，和键位写在一起：
+// 分两处迟早出现「说明写着 5 秒、按下去跳 10 秒」。
 /// ↑ / ↓ 一次调多少音量（音量刻度是 0~100）
 const VOL_STEP: f64 = 5.0;
 /// 音频舞台左边那块封面的边长上限（窗口窄的时候按比例缩）
@@ -296,6 +303,9 @@ enum Message {
     Dropped(PathBuf),
     /// 选了一个文件夹
     PickedFolder(Option<PathBuf>),
+    /// 点了空界面上的「最近播放」某一条。带路径而不是下标 —— 列表是筛过的，
+    /// 下标一旦对不上就会放错片子
+    OpenRecent(PathBuf),
     TogglePlay,
     Seek(f64),
     /// 方向键 ← / →：快退 / 快进，正数前进
@@ -310,6 +320,10 @@ enum Message {
     ToggleMute,
     /// 点音量键：弹出 / 收起音量 popover
     ToggleVolumePopover,
+    /// 把当前画面存成图片（S 键 / 底栏那颗相机）
+    Screenshot,
+    /// [ / ]：播放速度往慢 / 往快跳一档
+    SpeedStep(i8),
     /// 点左上角 logo：窗口置顶 / 取消置顶
     ToggleTopmost,
     ToggleFullscreen,
@@ -343,6 +357,10 @@ enum Message {
     StagePress,
     /// 在画面上松开左键
     StageRelease,
+    /// 鼠标停在进度条上（坐标是相对进度条那一行的）
+    BarHover(Point),
+    /// 鼠标离开进度条
+    BarLeave,
 
     // ---- 设置弹窗 ----
     /// 点底栏的齿轮
@@ -543,6 +561,54 @@ struct App {
     speed_popover: bool,
     /// 右键菜单的位置（窗口内的逻辑坐标）；None = 没展开
     context: Option<Point>,
+
+    /// 落盘的配置 + 每个文件的播放记录（见 `state.rs`）
+    state: State,
+    /// 有没有还没写盘的改动
+    state_dirty: bool,
+    /// 上次写盘的时刻（写盘按分钟级节流，别每帧都碰磁盘）
+    state_saved: Instant,
+    /// 上次记播放进度的时刻（记一次要读文件元信息，不能每帧都做）
+    state_note: Instant,
+    /// 刚打开的文件记下的「上次看到哪儿」。时长要等播放线程报上来才知道，
+    /// 所以先存着，tick 里条件成熟了再跳（见 `apply_resume`）。
+    pending_resume: Option<f64>,
+
+    /// 屏幕下方飘一下的短提示（「已保存：xxx.png」）：文字 + 出现时刻
+    notice: Option<(String, Instant)>,
+    /// 等截图文件真正落到磁盘：路径 + 发出时刻。
+    /// mpv 写文件是异步的，命令返回成功不等于文件已经在。
+    pending_shot: Option<(PathBuf, Instant)>,
+
+    /// 抽帧线程（进度条悬停预览）。起不来就是 `None`，功能静默失效。
+    thumbs: Option<Thumbs>,
+    /// 已经抽好的缩略图，按「片子 + 第几格」索引
+    thumb_cache: std::collections::HashMap<thumbs::Key, Thumb>,
+    /// 插入顺序，用来做上限淘汰
+    thumb_order: std::collections::VecDeque<thumbs::Key>,
+    /// 最近一张真的画出来的格子。等新格子的时候先拿它顶着，
+    /// 不然沿着进度条扫过去，预览会一闪一闪。
+    thumb_last: Option<thumbs::Key>,
+    /// 鼠标此刻停在进度条的哪个位置
+    bar_hover: Option<BarHover>,
+}
+
+/// 一张缩略图：除了 iced 的贴图句柄，还记着像素尺寸（摆浮层要算居中）
+struct Thumb {
+    handle: iced::widget::image::Handle,
+    w: f32,
+    h: f32,
+}
+
+/// 鼠标停在进度条上的状态。`ratio` 是选中位置在滑块上的比例，
+/// `bucket` 是它落在第几个 2 秒格。
+#[derive(Clone, Copy)]
+struct BarHover {
+    ratio: f32,
+    bucket: i64,
+    /// 停到这一刻为止。要停够 `THUMB_DWELL` 才真的去抽帧 ——
+    /// 手扫过进度条时不该疯狂解码。
+    since: Instant,
 }
 
 /// 拖边缘缩放时的起始快照，全部是物理像素（屏幕坐标）
@@ -584,6 +650,9 @@ impl App {
             Err(e) => (None, Some(e)),
         };
 
+        // 上次退出时的那套配置。读不出来就是默认值（`State::load` 保证不报错）。
+        let state = State::load();
+
         let mut app = Self {
             player,
             window: None,
@@ -613,7 +682,7 @@ impl App {
             pause_sent: None,
             duration: 0.0,
             position: 0.0,
-            volume: 80.0,
+            volume: state.volume,
             open_ms: None,
             fps: 0.0,
             seek_at: None,
@@ -622,14 +691,21 @@ impl App {
             anim_last: None,
             cursor: None,
             win_size: Size::new(1180.0, 720.0),
-            muted_before: 80.0,
-            fullscreen: false,
+            muted_before: state.volume,
+            fullscreen: state.fullscreen,
             focused: true,
             cursor_hidden: false,
             volume_popover: false,
             sub_popover: false,
             topmost: false,
-            settings: Settings::default(),
+            settings: Settings {
+                open: false,
+                tab: Tab::Picture,
+                fit: state.fit,
+                aspect: state.aspect,
+                look: state.look,
+                autoplay: state.autoplay,
+            },
             settings_anim: 0.0,
             playlist_anim: 0.0,
             stage_press: false,
@@ -645,9 +721,21 @@ impl App {
             info_open: false,
             info_anim: 0.0,
             info: None,
-            speed: 1.0,
+            speed: state.speed,
             speed_popover: false,
             context: None,
+            state,
+            state_dirty: false,
+            state_saved: Instant::now(),
+            state_note: Instant::now(),
+            pending_resume: None,
+            notice: None,
+            pending_shot: None,
+            thumbs: Thumbs::spawn().ok(),
+            thumb_cache: std::collections::HashMap::new(),
+            thumb_order: std::collections::VecDeque::new(),
+            thumb_last: None,
+            bar_hover: None,
         };
 
         if let Some(p) = &app.player {
@@ -673,6 +761,11 @@ impl App {
                 app.playlist.open = false;
                 app.settings.open = true;
                 app.settings.tab = Tab::Color;
+            }
+            Ok("keys") => {
+                app.playlist.open = false;
+                app.settings.open = true;
+                app.settings.tab = Tab::Keys;
             }
             Ok("about") => {
                 app.playlist.open = false;
@@ -709,6 +802,34 @@ impl App {
             self.error = Some(String::from("播放引擎没加载起来，无法播放。"));
             return;
         };
+
+        // 换片之前先把上一条看到哪儿了记下来。只在退出时记的话，一集接一集看下去
+        // 关掉之后就只剩最后一集的进度，前面看过的全忘了。
+        if let Some(prev) = self.current.clone()
+            && self.duration > 0.0
+        {
+            self.state.note_position(&prev, self.position, self.duration);
+            self.state_dirty = true;
+        }
+
+        // 这个文件上次看到哪儿了？等时长报上来之后再跳（见 `apply_resume`）。
+        self.pending_resume = self
+            .state
+            .progress_of(&path)
+            .filter(|p| p.resumable(0.0))
+            .map(|p| p.pos);
+        // 顺手记进「最近打开」
+        self.state.remember(&path);
+        self.state_dirty = true;
+
+        // 换片了：上一部片子的缩略图全部作废。
+        // 格子号只对得上同一部片子，留着既占内存又可能被错用。
+        if self.current.as_deref() != Some(path.as_path()) {
+            self.thumb_cache.clear();
+            self.thumb_order.clear();
+            self.thumb_last = None;
+            self.bar_hover = None;
+        }
 
         self.title = path
             .file_name()
@@ -1283,6 +1404,303 @@ impl App {
         self.last_active = Instant::now();
     }
 
+    // ---------------- 进度条悬停预览 ----------------
+
+    /// 进度行里两个时间标签的固定宽度。
+    ///
+    /// 定宽是**为了让滑块的位置可算**：悬停消息给的坐标是相对整行的，要换算成
+    /// 时间比例就得知道滑块从哪儿开始。让时间文字自己撑宽度（"00:09" 和
+    /// "1:02:05" 差十几个像素），滑块的位置就飘了，预览会比光标慢半拍。
+    const TIME_W: f32 = 54.0;
+
+    /// 鼠标停多久才真的去抽帧。太短的话手一扫就解一堆没人看的帧。
+    const THUMB_DWELL: Duration = Duration::from_millis(120);
+    /// 缓存上限。一格 160×90×4 ≈ 56KB，160 张不到 9MB。
+    const THUMB_MAX: usize = 160;
+
+    /// 光标落在进度条上的什么位置 —— 换算成时间比例和格子号。
+    ///
+    /// `p` 是相对进度条整行的坐标（由 `mouse_area` 的 `on_move` 给出）。
+    fn bar_hover_at(&self, p: Point) -> Option<BarHover> {
+        // 没有时长就没有时间轴可言；底栏收着的时候根本看不见，也不该弹预览
+        if self.duration <= 0.0 || self.bars < 0.9 {
+            return None;
+        }
+        let row_w = self.win_size.width - 2.0 * BAR_PAD_X;
+        let inset = Self::TIME_W + 10.0; // 左侧时间 + 间距
+        let slider_w = row_w - 2.0 * inset;
+        if slider_w <= 1.0 {
+            return None;
+        }
+        let ratio = ((p.x - inset) / slider_w).clamp(0.0, 1.0);
+        let t = ratio as f64 * self.duration;
+        Some(BarHover {
+            ratio,
+            bucket: thumbs::bucket_of(t),
+            since: Instant::now(),
+        })
+    }
+
+    /// 这一格现在能画吗？能就返回贴图和尺寸。
+    ///
+    /// 顺着进度条扫的时候，新的格子还没抽出来，先用上一张顶着 ——
+    /// 一闪一闪比慢半拍难受得多。
+    fn thumb_for(&self, bucket: i64) -> Option<(&iced::widget::image::Handle, f32, f32)> {
+        let path = self.current.as_ref()?.to_string_lossy().into_owned();
+        let key = (path, bucket);
+        let hit = self
+            .thumb_cache
+            .get(&key)
+            .or_else(|| self.thumb_last.as_ref().and_then(|k| self.thumb_cache.get(k)))?;
+        Some((&hit.handle, hit.w, hit.h))
+    }
+
+    /// 收抽好的帧、按需发请求。每帧调一次。
+    fn tick_thumbs(&mut self) {
+        // 先把线程抽好的收进来
+        if let Some(t) = &self.thumbs {
+            for shot in t.drain() {
+                let handle = iced::widget::image::Handle::from_rgba(shot.w, shot.h, shot.rgba);
+                self.thumb_cache.insert(
+                    shot.key.clone(),
+                    Thumb {
+                        handle,
+                        w: shot.w as f32,
+                        h: shot.h as f32,
+                    },
+                );
+                self.thumb_order.push_back(shot.key);
+            }
+            // 超上限就丢最老的
+            while self.thumb_order.len() > Self::THUMB_MAX {
+                if let Some(old) = self.thumb_order.pop_front() {
+                    self.thumb_cache.remove(&old);
+                    if self.thumb_last.as_ref() == Some(&old) {
+                        self.thumb_last = None;
+                    }
+                }
+            }
+        }
+
+        let Some(hover) = self.bar_hover else { return };
+        let Some(path) = self.current.clone() else {
+            return;
+        };
+        let key = (path.to_string_lossy().into_owned(), hover.bucket);
+
+        if self.thumb_cache.contains_key(&key) {
+            // 已经有的直接记成「当前这张」，等新格子的时候就拿它顶
+            self.thumb_last = Some(key);
+            return;
+        }
+
+        // 停够了才去抽
+        if hover.since.elapsed() >= Self::THUMB_DWELL
+            && let Some(t) = &self.thumbs
+        {
+            t.want(&path, hover.bucket);
+        }
+    }
+
+    /// 悬停预览那一小块：缩略图 + 时间，浮在进度条上方。
+    fn thumb_layer(&self) -> Option<Element<'_, Message>> {
+        let hover = self.bar_hover?;
+        if self.bars < 0.9 || self.duration <= 0.0 {
+            return None;
+        }
+        let (handle, w, h) = self.thumb_for(hover.bucket)?;
+        let at = (hover.bucket as f64 + 0.5) * thumbs::STEP;
+
+        let panel = container(
+            column![
+                iced::widget::image(handle.clone())
+                    .width(Length::Fixed(w))
+                    .height(Length::Fixed(h)),
+                text(fmt_time(at))
+                    .font(icon::UI_FONT)
+                    .size(12.0)
+                    .color(icon::TEXT),
+            ]
+            .spacing(3)
+            .align_x(Alignment::Center),
+        )
+        .padding(3)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.86))),
+            border: Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: icon::PANEL_LINE,
+            },
+            shadow: Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                offset: Vector::new(0.0, 3.0),
+                blur_radius: 12.0,
+            },
+            ..container::Style::default()
+        });
+
+        // 光标在滑块上的绝对横坐标
+        let inset = Self::TIME_W + 10.0;
+        let row_w = self.win_size.width - 2.0 * BAR_PAD_X;
+        let slider_w = row_w - 2.0 * inset;
+        let anchor = BAR_PAD_X + inset + hover.ratio * slider_w;
+        let win_w = self.win_size.width;
+
+        Some(
+            Float::new(panel)
+                .translate(move |bounds: Rectangle, viewport: Rectangle| {
+                    let x = (anchor - bounds.width / 2.0).clamp(6.0, (win_w - bounds.width - 6.0).max(6.0));
+                    // 底栏顶边再往上一点。底栏自己带阴影，贴太近会糊成一团
+                    let y = viewport.height - BOTTOM_H - bounds.height - 10.0;
+                    Vector::new(x - bounds.x, y - bounds.y)
+                })
+                .into(),
+        )
+    }
+
+    // ---------------- 截图 ----------------
+
+    /// 屏幕下方飘一条短提示。
+    ///
+    /// 不用弹窗：截图这种「顺手做一下」的动作，弹个要点的对话框反而碍事。
+    fn toast(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now()));
+    }
+
+    /// 截一张图：拼路径 → 交给播放线程 → 等文件真出现再报成功。
+    fn take_screenshot(&mut self) {
+        self.touch();
+        if self.current.is_none() {
+            self.toast("现在没有在放东西");
+            return;
+        }
+        if self.is_audio() {
+            self.toast("纯音频没有画面，截不了图");
+            return;
+        }
+        let path = self.screenshot_path();
+        self.send(Cmd::Screenshot(path.clone()));
+        self.pending_shot = Some((path, Instant::now()));
+    }
+
+    /// 截图存哪儿：`图片\Maneki\<片名>_<本地时间>.png`
+    fn screenshot_path(&self) -> PathBuf {
+        let dir = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Pictures")
+            .join("Maneki");
+        let stem = self
+            .current
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("screenshot"));
+        dir.join(format!(
+            "{}_{}.png",
+            safe_file_stem(&stem),
+            win32::local_stamp()
+        ))
+    }
+
+    /// 等截图落地。mpv 是异步写文件的，命令返回成功时文件可能还没写完，
+    /// 所以这里以「文件真的存在」为准，超时就算失败。
+    fn poll_screenshot(&mut self) {
+        let Some((path, at)) = self.pending_shot.clone() else {
+            return;
+        };
+        if path.is_file() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.toast(format!("已保存：{name}"));
+            self.pending_shot = None;
+        } else if at.elapsed() > Duration::from_millis(1600) {
+            self.toast("截图没成功（这个文件可能截不了）");
+            self.pending_shot = None;
+        }
+    }
+
+    /// [ / ] 调速度：在预设档位之间跳，越过最慢/最快就按 0.25 走。
+    fn step_speed(&mut self, dir: i8) {
+        let next = next_speed(self.speed, dir);
+        if (next - self.speed).abs() < 1e-9 {
+            return;
+        }
+        self.speed = next;
+        self.send(Cmd::Speed(next));
+        self.save_settings();
+        self.toast(format!("播放速度 {}", fmt_speed(next)));
+    }
+
+    // ---------------- 持久化 ----------------
+
+    /// 把界面上的这套配置抄进 `state`，并标记「该写盘了」。
+    ///
+    /// 这里**只标记，不写文件**：拖音量 / 速度滑块时数值每帧都在变，每帧写一次
+    /// 磁盘能把界面拖卡（机械盘上尤其明显）。真正的落盘在 `flush_state`，
+    /// 最少间隔 3 秒；退出时还会强制写一次。
+    fn save_settings(&mut self) {
+        self.state.volume = self.volume;
+        self.state.speed = self.speed;
+        self.state.fullscreen = self.fullscreen;
+        self.state.fit = self.settings.fit;
+        self.state.aspect = self.settings.aspect;
+        self.state.look = self.settings.look;
+        self.state.autoplay = self.settings.autoplay;
+        self.state_dirty = true;
+    }
+
+    /// 到点了就把状态写下去。
+    fn flush_state(&mut self) {
+        if !self.state_dirty || self.state_saved.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        self.state_dirty = false;
+        self.state_saved = Instant::now();
+        // 存不上就算了（磁盘满、目录没权限）。播放器不该因为记不住偏好就报错。
+        let _ = self.state.save();
+    }
+
+    /// 记一下「这个文件看到哪儿了」。
+    ///
+    /// 每秒最多问一次 `state`：判断有没有挪够 5 秒要用文件元信息当键，
+    /// 每帧都做就是每帧一次 `stat` 系统调用，几十 Hz 下来纯属浪费。
+    fn note_progress(&mut self) {
+        if self.state_note.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let Some(cur) = self.current.clone() else { return };
+        if self.duration <= 0.0 {
+            return;
+        }
+        self.state_note = Instant::now();
+        if self.state.note_position(&cur, self.position, self.duration) {
+            self.state_dirty = true;
+        }
+    }
+
+    /// 打开文件时记下的「上次看到这儿」，等时长和首帧都齐了再跳过去。
+    ///
+    /// 为什么不在 `play()` 里直接 `Seek`：那一刻 mpv 还没把文件解析完，
+    /// 时长是 0，发了也是白发（mpv 会按 0 处理，直接从头开始）。
+    fn apply_resume(&mut self) {
+        let Some(at) = self.pending_resume else { return };
+        // 时长还没报上来 / 还没真正放起来，再等等
+        if self.duration <= 0.0 || self.loading_since.is_some() {
+            return;
+        }
+        self.pending_resume = None;
+        if at <= 3.0 || at >= self.duration - 5.0 {
+            return;
+        }
+        self.position = at;
+        self.seek_at = Some(Instant::now());
+        self.send(Cmd::Seek(at));
+    }
+
     /// 客户区坐标 `p` 落在歌词面板的哪一行上（不在面板里就是 `None`）。
     ///
     /// 几何必须和 `audio_stage` 摆歌词的那几行一致：左边 45% 给封面，歌词只占
@@ -1492,6 +1910,14 @@ impl App {
                 let just_ended = snap.eof && !self.eof_prev;
                 self.eof_prev = snap.eof;
                 if just_ended
+                    && let Some(cur) = self.current.clone()
+                {
+                    // 已经看完了：把进度记录清掉，下次打开就该从头放，
+                    // 而不是「续播」到结尾前 3 秒。
+                    self.state.forget_position(&cur);
+                    self.state_dirty = true;
+                }
+                if just_ended
                     && self.settings.autoplay
                     && let Some(next) = self.playlist.select.map(|i| i + 1)
                     && next < self.playlist.items.len()
@@ -1504,6 +1930,15 @@ impl App {
         if let Some(next) = advance_to {
             self.play_index(next);
         }
+
+        // 播放进度 / 配置的落盘：续播要在时长和首帧都齐了之后才动，
+        // 记录和写盘各自有节流（见两个方法的注释）
+        self.apply_resume();
+        self.note_progress();
+        self.flush_state();
+
+        // 截图落地了没有（mpv 是异步写文件）
+        self.poll_screenshot();
 
         // 歌词跟着播放位置走（视频没有歌词，直接跳过）
         if self.is_audio() {
@@ -1770,6 +2205,7 @@ impl App {
         match message {
             Message::Tick => {
                 self.tick();
+                self.tick_thumbs();
                 self.note_cursor_state();
             }
 
@@ -1801,6 +2237,15 @@ impl App {
             }
             Message::PickedFolder(Some(dir)) => self.open_paths(vec![dir]),
             Message::PickedFolder(None) => {}
+            Message::OpenRecent(path) => {
+                self.touch();
+                if path.is_file() {
+                    self.open_paths(vec![path]);
+                } else {
+                    // 渲染时筛过一遍，正常点不到这里；文件刚被删掉才会撞上
+                    self.toast("这个文件已经不在了");
+                }
+            }
             Message::OpenDefaultApps => {
                 self.touch();
                 assoc::open_default_apps();
@@ -1817,6 +2262,7 @@ impl App {
             Message::Volume(vol) => {
                 self.volume = vol;
                 self.send(Cmd::Volume(vol));
+                self.save_settings();
             }
             Message::Prev => {
                 self.touch();
@@ -1841,6 +2287,12 @@ impl App {
                     };
                 }
                 self.send(Cmd::Volume(self.volume));
+                self.save_settings();
+            }
+            Message::Screenshot => self.take_screenshot(),
+            Message::SpeedStep(dir) => {
+                self.step_speed(dir);
+                self.touch();
             }
             Message::ToggleVolumePopover => {
                 self.touch();
@@ -1865,6 +2317,7 @@ impl App {
                     } else {
                         iced::window::Mode::Windowed
                     };
+                    self.save_settings();
                     return iced::window::set_mode(id, mode);
                 }
             }
@@ -1890,6 +2343,7 @@ impl App {
                 } else if self.fullscreen {
                     self.touch();
                     self.fullscreen = false;
+                    self.save_settings();
                     if let Some(id) = self.window {
                         return iced::window::set_mode(id, iced::window::Mode::Windowed);
                     }
@@ -1899,6 +2353,22 @@ impl App {
             Message::GotWindow(id) => {
                 self.window = id;
                 if let Some(id) = id {
+                    // 上次退出时是全屏，这次进来直接还原。
+                    // 必须等窗口建好（这一步就是 GotWindow）才切，早了没东西可切。
+                    if self.fullscreen {
+                        return Task::batch([
+                            iced::window::set_mode(id, iced::window::Mode::Fullscreen),
+                            iced::window::set_min_size(id, Some(Size::new(560.0, 400.0))),
+                            iced::window::run(id, |w| {
+                                use iced::window::raw_window_handle::RawWindowHandle;
+                                match w.window_handle().map(|h| h.as_raw()) {
+                                    Ok(RawWindowHandle::Win32(x)) => Some(x.hwnd.get()),
+                                    _ => None,
+                                }
+                            })
+                            .map(Message::GotHwnd),
+                        ]);
+                    }
                     return Task::batch([
                         // 再小顶底栏就叠一起了
                         iced::window::set_min_size(id, Some(Size::new(560.0, 400.0))),
@@ -1984,8 +2454,17 @@ impl App {
                 }
             }
             Message::WinClose => {
-                if let Some(id) = self.window {
-                    return iced::window::close(id);
+                // 关窗口之前立刻把进度和配置写下去：节流那套（3 秒 / 1 秒）
+                // 在这里等不了，进程马上就没了。
+                if let Some(cur) = self.current.clone()
+                    && self.duration > 0.0
+                {
+                    self.state.note_position(&cur, self.position, self.duration);
+                }
+                self.save_settings();
+                if let Some(win) = self.window {
+                    let _ = self.state.save();
+                    return iced::window::close(win);
                 }
             }
 
@@ -2037,6 +2516,15 @@ impl App {
                 }
             }
 
+            // ---- 进度条悬停预览 ----
+            //
+            // 这里只记「停在哪儿」。真正去抽帧要等鼠标停稳（`THUMB_DWELL`），
+            // 见 `animate`：手扫过进度条的时候不该一直解码。
+            Message::BarHover(p) => {
+                self.bar_hover = self.bar_hover_at(p);
+            }
+            Message::BarLeave => self.bar_hover = None,
+
             // ---- 设置抽屉 ----
             Message::OpenSettings => {
                 self.touch();
@@ -2059,6 +2547,7 @@ impl App {
             }
             Message::SetAutoplay(on) => {
                 self.settings.autoplay = on;
+                self.save_settings();
             }
             Message::OpenRepo => {
                 self.touch();
@@ -2067,16 +2556,20 @@ impl App {
             Message::SetFit(fit) => {
                 self.touch();
                 self.settings.fit = fit;
+                self.save_settings();
             }
             Message::SetAspect(aspect) => {
                 self.touch();
                 self.settings.aspect = aspect;
+                self.save_settings();
             }
             Message::SetLook(field, value) => {
                 self.settings.set_look(field, value);
+                self.save_settings();
             }
             Message::ResetLook => {
                 self.settings.look = video::Look::default();
+                self.save_settings();
             }
             Message::ToggleSubtitlePopover => {
                 self.touch();
@@ -2204,6 +2697,7 @@ impl App {
                 self.speed = (v * 100.0).round() / 100.0;
                 // 只下发一次：播放线程自己记着这个倍率，换集时会重新应用一遍
                 self.send(Cmd::Speed(self.speed));
+                self.save_settings();
             }
 
             // ---- 右键菜单 ----
@@ -2310,32 +2804,13 @@ impl App {
                 iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
                     Some(Message::Modifiers(m.control()))
                 }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, repeat, .. }) => {
-                    match key {
-                        // 空格是「切一下」，按住不放会疯狂切，所以只认第一次
-                        keyboard::Key::Named(keyboard::key::Named::Space) if !repeat => {
-                            Some(Message::TogglePlay)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::Escape),
-                        // 方向键：左右跳进度，上下调音量。
-                        // 这几条**故意**连 repeat 一起收：按住 → 应该一路快进，
-                        // 按住 ↑ 应该匀速升音量，这才是播放器该有的手感。
-                        // 进度那边有 60ms 的节流（见 `nudge`），不会把 seek 请求堆满。
-                        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                            Some(Message::Nudge(SEEK_STEP))
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                            Some(Message::Nudge(-SEEK_STEP))
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                            Some(Message::NudgeVolume(VOL_STEP))
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                            Some(Message::NudgeVolume(-VOL_STEP))
-                        }
-                        _ => None,
-                    }
-                }
+                // 键位表在 `keys.rs`（和设置页里那份说明是同一份数据）
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    repeat,
+                    ..
+                }) => keys::bind(&key, modifiers, repeat),
                 _ => None,
             }),
         ])
@@ -2437,40 +2912,47 @@ impl App {
             // 这里不用再把「拖文件进来」摆一遍 —— 用户刚拖完，那样等于当没收到。
             self.pick_stage()
         } else {
-            container(
-                column![
-                    iced::widget::image(iced::widget::image::Handle::from_rgba(
-                        LOGO_BIG_SRC,
-                        LOGO_BIG_SRC,
-                        LOGO_BIG_RGBA,
-                    ))
-                    .width(Length::Fixed(LOGO_HERO))
-                    .height(Length::Fixed(LOGO_HERO)),
-                    text("把视频、音频或文件夹拖进来")
-                        .font(icon::UI_FONT)
-                        .size(20)
-                        .color(icon::TEXT_DIM),
-                    text("拖文件夹会把里面的视频和音频全部排进播放列表")
-                        .font(icon::UI_FONT)
-                        .size(14)
-                        .color(icon::TEXT_FAINT),
-                    row![
-                        pill_button("打开文件", Message::OpenDialog),
-                        pill_button("打开文件夹", Message::PickFolder),
-                        pill_button("设为默认播放器", Message::OpenDefaultApps),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
+            let mut hint = column![
+                iced::widget::image(iced::widget::image::Handle::from_rgba(
+                    LOGO_BIG_SRC,
+                    LOGO_BIG_SRC,
+                    LOGO_BIG_RGBA,
+                ))
+                .width(Length::Fixed(LOGO_HERO))
+                .height(Length::Fixed(LOGO_HERO)),
+                text("把视频、音频或文件夹拖进来")
+                    .font(icon::UI_FONT)
+                    .size(20)
+                    .color(icon::TEXT_DIM),
+                text("拖文件夹会把里面的视频和音频全部排进播放列表")
+                    .font(icon::UI_FONT)
+                    .size(14)
+                    .color(icon::TEXT_FAINT),
+                row![
+                    pill_button("打开文件", Message::OpenDialog),
+                    pill_button("打开文件夹", Message::PickFolder),
+                    pill_button("设为默认播放器", Message::OpenDefaultApps),
                 ]
-                .spacing(12)
-                .align_x(Alignment::Center),
-            )
-            .center(Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Color(Color::BLACK)),
-                ..container::Style::default()
-            })
-            .into()
+                .spacing(10)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(12)
+            .align_x(Alignment::Center);
+
+            // 「观看记录」：有上次看到哪儿就直接摆出来，点一下接着看。
+            // 没有记录时整块不出现，不占位。
+            let recent = self.state.recent_files(RECENT_SHOWN);
+            if !recent.is_empty() {
+                hint = hint.push(recent_block(recent));
+            }
+
+            container(hint)
+                .center(Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color::BLACK)),
+                    ..container::Style::default()
+                })
+                .into()
         };
 
         // 收起进度：0 = 完全露出，1 = 完全移出画面
@@ -2498,6 +2980,12 @@ impl App {
             Float::new(self.bottom_bar())
                 .translate(move |_: Rectangle, _: Rectangle| Vector::new(0.0, bottom_shift)),
         );
+
+        // 进度条悬停预览：压在底栏上面，但比抽屉 / popover 低 ——
+        // 抽屉一开就该盖住它，不然图片会从面板缝里露出来。
+        if let Some(layer) = self.thumb_layer() {
+            layers = layers.push(layer);
+        }
 
         // 三条右侧抽屉：夹在 cover 和顶栏之间。
         // 上下让出 TOP_H / BOTTOM_H，抽屉不会盖住窗口按钮和播放控制；
@@ -2551,6 +3039,13 @@ impl App {
         }
         if let Some(at) = self.context {
             layers = layers.push(self.context_menu(at));
+        }
+
+        // 短提示（截图结果之类）压在浮层之上：它只活两秒多，被盖住就等于没说
+        if let Some((text, at)) = &self.notice
+            && at.elapsed() < NOTICE_LIFE
+        {
+            layers = layers.push(self.notice_layer(text));
         }
 
         // 缩放热区必须压在最后一层，否则会被顶底栏的拖拽热区吃掉。
@@ -2954,10 +3449,14 @@ impl App {
         // 轨道本身照常可见。鼠标移到进度条上（Status::Hovered）或正在拖
         // （Dragged）才把手柄放出来，同时轨道略微加粗一点作为「可以拖」的反馈。
         let progress = row![
-            text(fmt_time(self.position))
-                .font(icon::UI_FONT)
-                .size(13)
-                .color(icon::TEXT_DIM),
+            container(
+                text(fmt_time(self.position))
+                    .font(icon::UI_FONT)
+                    .size(13)
+                    .color(icon::TEXT_DIM),
+            )
+            .width(Length::Fixed(Self::TIME_W))
+            .align_x(Horizontal::Right),
             slider(0.0..=total, self.position, Message::Seek)
                 .width(Fill)
                 // 高度只决定**命中区**：iced 的 slider 把轨道画在 bounds 的正中，
@@ -2965,13 +3464,24 @@ impl App {
                 // 上下各 9px 变成各 13px —— 手一抖就点空的情况少很多。
                 .height(26.0)
                 .style(progress_slider_style),
-            text(fmt_time(self.duration))
-                .font(icon::UI_FONT)
-                .size(13)
-                .color(icon::TEXT_DIM),
+            container(
+                text(fmt_time(self.duration))
+                    .font(icon::UI_FONT)
+                    .size(13)
+                    .color(icon::TEXT_DIM),
+            )
+            .width(Length::Fixed(Self::TIME_W))
+            .align_x(Horizontal::Left),
         ]
         .spacing(10)
         .align_y(Alignment::Center);
+
+        // 整行外面套一层只为接「鼠标停在哪儿」：`on_move` 给的是相对本行的坐标，
+        // 用它换算预览位置最省事。mouse_area 会先把事件交给里面的滑块，
+        // 只有滑块不要的（移动）才轮到这里 —— 所以拖动进度条照旧。
+        let progress = mouse_area(progress)
+            .on_move(Message::BarHover)
+            .on_exit(Message::BarLeave);
 
         // 中间：上一集 / 播放暂停 / 下一集
         // 一条都没加载时（打开文件夹后的「挑一个」界面）画的必须是播放三角，
@@ -3018,6 +3528,8 @@ impl App {
                 sub_color,
                 self.sub_popover,
             ),
+            // 截图：紧挨着字幕键右边（都是「跟这一帧有关」的动作）
+            screenshot_button(),
         ]
         .spacing(ICON_GAP)
         .align_y(Alignment::Center);
@@ -3154,6 +3666,44 @@ impl App {
                     BAR_PAD_X - bounds.x,
                     _viewport.height - BOTTOM_H - POP_GAP - bounds.y - bounds.height,
                 )
+            })
+            .into()
+    }
+
+    /// 底部居中的一条短提示（黑色胶囊 + 一行字），飘 2.6 秒自己消失。
+    fn notice_layer(&self, msg: &str) -> Element<'_, Message> {
+        let pill = container(
+            text(msg.to_string())
+                .font(icon::UI_FONT)
+                .size(13.0)
+                .color(icon::TEXT),
+        )
+        .padding(Padding {
+            top: 8.0,
+            right: 16.0,
+            bottom: 8.0,
+            left: 16.0,
+        })
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.74))),
+            border: Border {
+                radius: 18.0.into(),
+                width: 1.0,
+                color: icon::PANEL_LINE,
+            },
+            shadow: Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+                offset: Vector::new(0.0, 2.0),
+                blur_radius: 12.0,
+            },
+            ..container::Style::default()
+        });
+
+        // 底栏上方浮着，不挡播放控制；全屏时也照常出现（那时底栏已经收起来了）
+        Float::new(container(pill).center(Fill))
+            .translate(move |bounds: Rectangle, viewport: Rectangle| {
+                let target = viewport.height - BOTTOM_H - 44.0;
+                Vector::new(0.0, target - (bounds.y + bounds.height / 2.0))
             })
             .into()
     }
@@ -3774,6 +4324,69 @@ fn icon_button<'a>(glyph: char, size: f32, msg: Message) -> Element<'a, Message>
     icon_button_tinted(glyph, size, msg, icon::TEXT, false)
 }
 
+/// 空界面上最多摆几条「最近播放」
+const RECENT_SHOWN: usize = 4;
+/// 这一块的宽度。居中摆，和上面那排胶囊按钮差不多宽。
+const RECENT_W: f32 = 420.0;
+
+/// 「最近播放」：文件名 + 上次看到哪儿，点一条直接接着看。
+///
+/// 标题用「最近播放」而不是「最近打开」：这里给出的位置就是上次停下的地方，
+/// 点下去会从那儿续上，叫「播放」才不误导。
+fn recent_block(rows: Vec<(PathBuf, Option<state::Progress>)>) -> Element<'static, Message> {
+    let mut list = column![text("最近播放")
+        .font(icon::UI_FONT)
+        .size(12.0)
+        .color(icon::TEXT_FAINT)]
+    .spacing(4)
+    .width(Length::Fixed(RECENT_W));
+
+    for (path, at) in rows {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+        // 右半边：有进度就写「看到哪 / 全长」，没有就写「从头开始」。
+        // 只写一个数字（比如 12:30）会让人以为是总时长。
+        let tail = match at.filter(|p| p.resumable(0.0)) {
+            Some(p) => format!("{} / {}", fmt_time(p.pos), fmt_time(p.dur)),
+            None => String::from("从头开始"),
+        };
+
+        list = list.push(
+            button(
+                row![
+                    text(ui::elide(&name, RECENT_W - 120.0, 13.0))
+                        .font(icon::UI_FONT)
+                        .size(13.0)
+                        .color(icon::TEXT_DIM)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .width(Fill),
+                    text(tail)
+                        .font(icon::UI_FONT)
+                        .size(11.5)
+                        .color(icon::TEXT_FAINT)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(10),
+            )
+            .padding(Padding {
+                top: 6.0,
+                right: 10.0,
+                bottom: 6.0,
+                left: 10.0,
+            })
+            .width(Length::Fixed(RECENT_W))
+            .on_press(Message::OpenRecent(path))
+            .style(pill_style),
+        );
+    }
+
+    list.into()
+}
+
 /// 空白页上的文字按钮（描边胶囊），比图标按钮更适合放中文标签
 fn pill_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
     button(text(label).font(icon::UI_FONT).size(14).color(icon::TEXT_DIM))
@@ -3823,6 +4436,68 @@ fn icon_button_tinted<'a>(
     .on_press(msg)
     .style(if active { solid_button } else { ghost_button })
     .into()
+}
+
+/// 截图按钮：相机图标。
+///
+/// 图标字体里 21 个字形**没有相机**（我把整个 cmap 打出来逐个看过：搜索、关闭、
+/// 设置、太阳、播放三角、信息、全屏角、麦克风、喇叭、月亮……就是没有相机）。
+/// 暂停图标当年也是这么处理过来的 —— 用圆角容器手绘，尺寸按 17px 图标字形的
+/// 视觉重量对：机身 16×11、镜头 ⌀6、顶部一小块取景凸起。
+fn screenshot_button<'a>() -> Element<'a, Message> {
+    button(
+        container(camera_icon())
+            .center(Length::Fixed(ICON_BTN)),
+    )
+    .padding(0)
+    .on_press(Message::Screenshot)
+    .style(ghost_button)
+    .into()
+}
+
+fn camera_icon<'a>() -> Element<'a, Message> {
+    let line = |width: f32, radius: f32| {
+        move |_t: &Theme| container::Style {
+            border: Border {
+                radius: radius.into(),
+                width,
+                color: icon::TEXT,
+            },
+            ..container::Style::default()
+        }
+    };
+
+    // 镜头：机身里居中的一个小圆
+    let lens = container(space())
+        .width(Length::Fixed(6.0))
+        .height(Length::Fixed(6.0))
+        .style(line(1.2, 3.0));
+
+    // 机身
+    let body = container(lens)
+        .width(Length::Fixed(16.0))
+        .height(Length::Fixed(11.0))
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .style(line(1.2, 3.0));
+
+    // 顶部取景凸起：实心小横条压在机身上沿
+    let bump = container(space())
+        .width(Length::Fixed(6.0))
+        .height(Length::Fixed(2.5))
+        .style(|_t: &Theme| container::Style {
+            background: Some(Background::Color(icon::TEXT)),
+            border: Border {
+                radius: 1.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        });
+
+    column![bump, body]
+        .spacing(0)
+        .align_x(Alignment::Center)
+        .into()
 }
 
 /// 底栏左下角的播放速度键：一颗显示当前倍速的小胶囊。
@@ -3934,6 +4609,47 @@ fn menu_item<'a>(glyph: char, label: &'a str, msg: Message) -> Element<'a, Messa
 }
 
 /// 倍速的显示文本：`1.0×` / `1.25×` / `8.0×`（末尾的 0 去掉，但至少留一位小数）
+/// 下一档播放速度：先走 `SPEEDS` 那几档，超出两头就按 0.25 递增。
+///
+/// 只跳预设档是有意的：`[` `]` 是「微调」，一下从 1.0 跳到 1.9 会很错愕；
+/// 而 4× 以上没有预设，连续按就得能一路上去（0.25 一档，按着不放也不难受）。
+fn next_speed(cur: f64, dir: i8) -> f64 {
+    let up = dir > 0;
+    let step = SPEEDS
+        .iter()
+        .copied()
+        .filter(|s| if up { *s > cur + 1e-6 } else { *s < cur - 1e-6 })
+        .fold(None::<f64>, |acc, s| match acc {
+            // 往上找「最小的更大的」；往下找「最大的更小的」
+            None => Some(s),
+            Some(a) if up && s < a => Some(s),
+            Some(a) if !up && s > a => Some(s),
+            Some(a) => Some(a),
+        });
+
+    let next = step.unwrap_or(if up { cur + 0.25 } else { cur - 0.25 });
+    ((next.clamp(SPEED_MIN, SPEED_MAX) * 100.0).round() / 100.0).max(SPEED_MIN)
+}
+
+/// 把片名收拾成能当文件名的样子。
+///
+/// Windows 文件名里不能有 `\ / : * ? " < > |`，替换成下划线；结尾的空格和点
+/// 会被系统悄悄吃掉（`a.mp4 ` 变成 `a.mp4`），这里先削掉；太长也截一下 ——
+/// 文件名超过 255 字节时整个写盘会失败，截到 80 个字符离红线还很远。
+fn safe_file_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .take(80)
+        .collect();
+    let trimmed = cleaned.trim_end_matches([' ', '.']).trim_start();
+    if trimmed.is_empty() {
+        String::from("screenshot")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn fmt_speed(speed: f64) -> String {
     let r = (speed * 100.0).round() / 100.0;
     let mut t = format!("{r:.2}");
@@ -4107,6 +4823,7 @@ fn fmt_time(t: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::SEEK_STEP;
 
     fn make_dir(name: &str, files: &[&str]) -> PathBuf {
         let root = std::env::temp_dir().join(name);
@@ -5095,6 +5812,61 @@ mod tests {
         assert!(!app.cursor_hidden);
     }
 
+    /// 续播：时长已知、首帧出了之后才跳；到结尾 / 太靠前 / 时长未知都不跳。
+    #[test]
+    fn resume_seeks_only_when_there_is_something_to_resume() {
+        let mut app = app();
+        app.current = Some(PathBuf::from("D:/movie.mkv"));
+        app.duration = 600.0;
+        app.loading_since = None;
+        app.pending_resume = Some(120.0);
+
+        app.apply_resume();
+        assert_eq!(app.position, 120.0, "应该跳到上次的位置");
+        assert!(app.seek_at.is_some(), "要记下时刻，免得被旧快照拽回 0");
+        assert!(app.pending_resume.is_none(), "续播只做一次");
+
+        // 时长还没报上来：先等着，别把 0 当成「已经知道时长」去跳
+        app.pending_resume = Some(120.0);
+        app.duration = 0.0;
+        app.position = 0.0;
+        app.apply_resume();
+        assert_eq!(app.position, 0.0, "时长未知时不能跳");
+        assert!(app.pending_resume.is_some(), "等时长到了再跳");
+
+        // 首帧还没出（还在加载）：同样等着
+        app.duration = 600.0;
+        app.loading_since = Some(Instant::now());
+        app.apply_resume();
+        assert_eq!(app.position, 0.0);
+
+        // 已经看到结尾了，就不要跳回去重看最后几秒
+        app.loading_since = None;
+        app.pending_resume = Some(598.0);
+        app.position = 0.0;
+        app.apply_resume();
+        assert_eq!(app.position, 0.0);
+    }
+
+    /// 上一集看到一半就切下一集：进度必须当场记下来（不能等退出）
+    #[test]
+    fn switching_files_keeps_the_previous_position() {
+        let mut app = app();
+        let prev = PathBuf::from("D:/ep1.mkv");
+        app.current = Some(prev.clone());
+        app.position = 300.0;
+        app.duration = 1200.0;
+
+        // 相当于 play() 开头那一段
+        if let Some(p) = app.current.clone()
+            && app.duration > 0.0
+        {
+            app.state.note_position(&p, app.position, app.duration);
+        }
+        let got = app.state.progress_of(&prev).map(|x| x.pos);
+        assert_eq!(got, Some(300.0), "切集之前要把上一集的位置存下来");
+    }
+
     /// 转圈的相位只在换片期间往前走，转满一圈要回到 0（不然浮点数会越加越大）
     #[test]
     fn spinner_phase_wraps_once_per_turn() {
@@ -5206,5 +5978,70 @@ mod tests {
 
         let _ = app.update(Message::TogglePlay);
         assert!(!app.paused, "再按一次要能恢复");
+    }
+
+    // ---------------- 进度条悬停 ----------------
+
+    /// 悬停位置要能换算成正确的时间格。
+    ///
+    /// 这里的数字不是随便写的：进度行宽度 = 窗口宽 - 两侧内边距，滑块左边还要
+    /// 让出「时间文字 + 间距」。几何一旦和 `bottom_bar()` 里那段对不上，
+    /// 预览就会和光标错位，所以把它钉死在测试里。
+    #[test]
+    fn hover_maps_across_the_whole_bar() {
+        let mut app = app();
+        app.duration = 60.0;
+        app.bars = 1.0;
+        app.win_size = Size::new(1180.0, 720.0);
+
+        let inset = App::TIME_W + 10.0;
+        let slider_w = 1180.0 - 2.0 * BAR_PAD_X - 2.0 * inset;
+        let at = |x: f32| app.bar_hover_at(Point::new(x, 13.0)).map(|h| h.bucket);
+
+        // 滑块最左边 = 0 秒，最右边 = 全长
+        assert_eq!(at(inset), Some(0));
+        assert_eq!(at(inset + slider_w), Some(30));
+        // 正中 = 一半
+        assert_eq!(at(inset + slider_w / 2.0), Some(15));
+        // 落在时间文字上的（滑块外面）夹到两端，不能算出负数或超过时长
+        assert_eq!(at(0.0), Some(0));
+        assert_eq!(at(5000.0), Some(30));
+    }
+
+    #[test]
+    fn hover_needs_a_duration_and_a_visible_bar() {
+        let mut app = app();
+        app.duration = 0.0;
+        app.bars = 1.0;
+        assert!(app.bar_hover_at(Point::new(600.0, 13.0)).is_none(), "没时长不该弹预览");
+
+        app.duration = 60.0;
+        app.bars = 0.0;
+        assert!(app.bar_hover_at(Point::new(600.0, 13.0)).is_none(), "底栏收着不该弹预览");
+
+        app.bars = 1.0;
+        assert!(app.bar_hover_at(Point::new(600.0, 13.0)).is_some());
+    }
+
+    /// 光标停在同一个格子上一遍遍报回来，不该反复让线程去抽帧。
+    #[test]
+    fn hover_only_asks_once_after_the_dwell() {
+        let mut app = app();
+        app.duration = 60.0;
+        app.bars = 1.0;
+        app.current = Some(PathBuf::from(r"C://a//b//movie.mp4"));
+        app.bar_hover = app.bar_hover_at(Point::new(600.0, 13.0));
+
+        // 还没停够：什么都不做（缓存也没有）
+        app.tick_thumbs();
+        assert!(app.thumb_cache.is_empty());
+
+        // 停够了：请求发出去（线程有没有真抽到不在这里验）
+        if let Some(h) = app.bar_hover.as_mut() {
+            h.since = Instant::now() - App::THUMB_DWELL - Duration::from_millis(10);
+        }
+        app.tick_thumbs();
+        // 结果要等线程回话，这一帧肯定还空着
+        assert!(app.thumb_cache.is_empty(), "抽帧是异步的，不该同步就有图");
     }
 }

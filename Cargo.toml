@@ -1,6 +1,6 @@
 [package]
 name = "maneki"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -9,6 +9,9 @@ edition = "2024"
 iced = { version = "0.14.0", features = ["image-without-codecs", "tokio", "canvas", "advanced"] }
 libloading = "0.9.0"
 rfd = "0.17.2"
+# 本地状态文件（音量 / 倍速 / 每个文件看到哪儿了）。只用 `Value` 读写，不引 derive，
+# 所以只多这一个 crate：serde 本来就在依赖树里。
+serde_json = "1"
 # 音频播放（视频和其余音频格式还是 libmpv；rodio 只管纯音频，省得为了一首歌
 # 也去起一套 libmpv 的软渲染）
 #

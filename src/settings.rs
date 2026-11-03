@@ -32,6 +32,7 @@ pub enum Tab {
     #[default]
     Picture,
     Color,
+    Keys,
     About,
 }
 
@@ -40,11 +41,12 @@ impl Tab {
         match self {
             Tab::Picture => "画面",
             Tab::Color => "色彩",
+            Tab::Keys => "快捷键",
             Tab::About => "关于",
         }
     }
 
-    const ALL: [Tab; 3] = [Tab::Picture, Tab::Color, Tab::About];
+    const ALL: [Tab; 4] = [Tab::Picture, Tab::Color, Tab::Keys, Tab::About];
 }
 
 /// 色彩调整里能被点的那几项
@@ -131,6 +133,7 @@ pub fn drawer<'a>(s: &'a Settings) -> Element<'a, Message> {
     let content: Element<'a, Message> = match s.tab {
         Tab::Picture => picture_tab(s),
         Tab::Color => color_tab(s),
+        Tab::Keys => keys_tab(),
         Tab::About => about_tab(),
     };
 
@@ -474,6 +477,76 @@ fn fmt_block(label: &'static str, value: String) -> Element<'static, Message> {
 ///
 /// 内容都是编译期常量（`env!("CARGO_PKG_VERSION")` + 硬编码的清单），
 /// 不读运行时状态，所以不接收 `&Settings`，换页也不会有任何开销。
+// ---------------- 快捷键 ----------------
+
+/// 快捷键说明：左边键位（等宽胶囊）、右边功能。
+///
+/// 内容来自 `keys.rs` 的 `GROUPS` —— 和真正生效的键位是同一份数据，
+/// 不会出现「说明里写了、按下去没反应」。
+fn keys_tab() -> Element<'static, Message> {
+    let mut col = column![].spacing(6).width(Fill);
+
+    for (i, (group, rows)) in crate::keys::GROUPS.iter().enumerate() {
+        if i > 0 {
+            col = col.push(gap(14.0));
+        }
+        col = col.push(section(group));
+        for s in rows.iter() {
+            col = col.push(key_row(s.keys, s.what));
+        }
+    }
+
+    col = col.push(gap(16.0));
+    col = col.push(
+        text("鼠标：滚轮在歌词区上下滚一行，Ctrl+滚轮调字号；点歌词跳到那一句")
+            .font(icon::UI_FONT)
+            .size(12.0)
+            .color(icon::TEXT_FAINT)
+            .width(Fill),
+    );
+
+    container(col).width(Fill).into()
+}
+
+/// 一行快捷键：键位块 + 说明。键位块定宽，右半边才对得齐。
+fn key_row(keys: &'static str, what: &'static str) -> Element<'static, Message> {
+    row![
+        container(
+            text(keys)
+                .font(icon::UI_FONT)
+                .size(12.0)
+                .color(icon::TEXT)
+                .align_x(Horizontal::Center)
+                .width(Fill),
+        )
+        .width(Length::Fixed(126.0))
+        .padding(Padding {
+            top: 4.0,
+            right: 6.0,
+            bottom: 4.0,
+            left: 6.0,
+        })
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.07))),
+            border: Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.10),
+            },
+            ..container::Style::default()
+        }),
+        // 说明文字：长了自己换行，不把右边界撑破
+        text(what)
+            .font(icon::UI_FONT)
+            .size(12.5)
+            .color(icon::TEXT_DIM)
+            .width(Fill),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn about_tab() -> Element<'static, Message> {
     let version = env!("CARGO_PKG_VERSION");
 

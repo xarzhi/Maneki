@@ -37,6 +37,20 @@ unsafe extern "system" {
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
     fn GetMonitorInfoW(monitor: isize, info: *mut c_void) -> i32;
+    fn GetLocalTime(time: *mut SystemTime) -> ();
+}
+
+/// `SYSTEMTIME`。字段顺序不能改，它是 ABI。
+#[repr(C)]
+struct SystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    millis: u16,
 }
 
 #[repr(C)]
@@ -287,4 +301,26 @@ pub fn set_topmost(hwnd: isize, on: bool) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+}
+
+/// 本地时间的紧凑写法 `20261103-190500`，截图文件名用。
+///
+/// 不用 `SystemTime` 转：那个得到的是 UTC，中国用户看到的文件名会差 8 小时。
+/// `GetLocalTime` 直接给本地时间，也不用为了时区去拉一个日期库。
+pub fn local_stamp() -> String {
+    let mut t = SystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        millis: 0,
+    };
+    unsafe { GetLocalTime(&mut t) };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
 }

@@ -51,6 +51,8 @@ pub enum Cmd {
     SubAdd(PathBuf),
     /// 选字幕轨；None = 关掉字幕
     SetSid(Option<i64>),
+    /// 把当前画面存成图片（路径由 UI 那边拼好，含片名和时间码）
+    Screenshot(PathBuf),
     Shutdown,
 }
 
@@ -343,6 +345,15 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
                 Cmd::SetSid(id) => {
                     mpv.set_sid(id);
                     snap.sid = id;
+                }
+                Cmd::Screenshot(path) => {
+                    // 纯音频没有画面，也没有 mpv 在解码它 —— 截了也是上一部片子的画面。
+                    // 这里直接失败，让 UI 那条「还在路上」的等待超时后给出提示。
+                    if !audio_mode
+                        && let Err(e) = mpv.screenshot_to_file(&path.to_string_lossy())
+                    {
+                        snap.error = Some(format!("截图失败：{e}"));
+                    }
                 }
                 Cmd::Shutdown => return,
             }

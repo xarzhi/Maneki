@@ -196,10 +196,22 @@ fn load_libmpv() -> Result<Library, String> {
     Err(format!("libmpv-2.dll 加载失败：\n  {}", tried.join("\n  ")))
 }
 
+/// 一个 mpv 实例是拿来干什么的。三种用途的选项差别不小，所以做成显式模式，
+/// 而不是一堆布尔开关。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// 真正放片子：渲染上下文 + 正常解码
+    Play,
+    /// 只读时长：不建渲染上下文，安静到极点
+    Probe,
+    /// 抽帧（进度条悬停预览）：要渲染上下文，但不出声、不往后播、只用软解
+    Frames,
+}
+
 impl Mpv {
     /// 正常播放用的实例：软件渲染上下文 + 一整套「几十 GB 也能秒开」的选项
     pub fn new() -> Result<Self, String> {
-        Self::build(true)
+        Self::build(Mode::Play)
     }
 
     /// 只用来读时长的实例：不建渲染上下文、不接声卡、不开画面。
@@ -209,10 +221,20 @@ impl Mpv {
     /// 它只解容器头，不解码，几十毫秒一条。用独立实例是因为主播放器正在放片子，
     /// 不能拿它去开别的文件。
     pub fn probe() -> Result<Self, String> {
-        Self::build(false)
+        Self::build(Mode::Probe)
     }
 
-    fn build(with_render: bool) -> Result<Self, String> {
+    /// 抽帧用的实例：要渲染上下文（不然拿不到画面），但要**安静** ——
+    /// 不出声、光有画面也不往后放、软解不用显卡。
+    ///
+    /// 进度条悬停缩略图就靠它：它是独立实例，所以再怎么 seek 都不会打断
+    /// 正在播放的那一个。
+    pub fn frames() -> Result<Self, String> {
+        Self::build(Mode::Frames)
+    }
+
+    fn build(mode: Mode) -> Result<Self, String> {
+        let with_render = mode != Mode::Probe;
         let lib = load_libmpv()?;
 
         unsafe {
@@ -239,6 +261,13 @@ impl Mpv {
 
             // 允许用环境变量覆盖（便于对比不同硬解策略的启动开销）
             let hwdec = std::env::var("QP_HWDEC").unwrap_or_else(|_| String::from("auto-safe"));
+            // 抽帧实例一律软解：缩略图本来就是 CPU 缩放出来的，走硬解只会多一次
+            // 「解到显存再拷回来」，还容易和主播放器抢同一个解码器会话。
+            let hwdec = if mode == Mode::Frames {
+                String::from("no")
+            } else {
+                hwdec
+            };
 
             // ---- 这些选项决定了「几十 GB 也能秒开」 ----
             // 不读用户配置、不跑脚本、不要内置 OSD；空闲待命而不是直接退出
@@ -284,6 +313,15 @@ impl Mpv {
                 // 不出声了，`pause=yes` 也保证它不会真的往后解码。
                 options.push(("ao", "null".into()));
                 options.push(("pause", "yes".into()));
+            } else if mode == Mode::Frames {
+                // 抽帧也要安静，但它得有画面：出帧靠渲染 API，声音和「往后放」
+                // 都不需要。`pause=yes` 是关键 —— 不这样的话 loadfile 之后它
+                // 会自己往后播，我们 seek 过去的那一帧还没画出来就被冲掉了。
+                options.push(("ao", "null".into()));
+                options.push(("aid", "no".into()));
+                options.push(("pause", "yes".into()));
+                // 缩略图小，别让 mpv 为它启多线程解码抢 CPU
+                options.push(("vd-lavc-threads", "1".into()));
             }
 
             for (k, v) in &options {
@@ -436,6 +474,33 @@ impl Mpv {
             c"sub-add".as_ptr(),
             cpath.as_ptr(),
             c"select".as_ptr(),
+            ptr::null(),
+        ];
+        let rc = unsafe { (self.command)(self.ctx, args.as_mut_ptr()) };
+        if rc < 0 {
+            return Err(self.describe(rc));
+        }
+        Ok(())
+    }
+
+    /// 把当前这一帧存成图片文件（格式看后缀，mpv 自己选编码器）。
+    ///
+    /// 用 mpv 自己截而不是我们把 `render_into` 那帧拉出来存：
+    /// - 它截的是**视频原始分辨率**，不是我们缩到窗口大小的那版；
+    /// - 界面上的亮度/对比度是着色器里做的，截图不该把调色腌进去；
+    /// - 少一次 8MB 级别的内存拷贝。
+    ///
+    /// `"video"` 表示不带字幕（默认会带）。截图是留画面，不是留字幕。
+    pub fn screenshot_to_file(&self, path: &str) -> Result<(), String> {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("建不了截图目录 {}：{e}", dir.display()))?;
+        }
+        let cpath = CString::new(path).map_err(|_| String::from("路径里含有非法字符（NUL）"))?;
+        let mut args: [*const c_char; 4] = [
+            c"screenshot-to-file".as_ptr(),
+            cpath.as_ptr(),
+            c"video".as_ptr(),
             ptr::null(),
         ];
         let rc = unsafe { (self.command)(self.ctx, args.as_mut_ptr()) };
