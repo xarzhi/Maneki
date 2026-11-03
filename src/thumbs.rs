@@ -16,11 +16,20 @@
 //! 渲染上下文，读到的往往是**纯黑底色**（目标帧还在从关键帧往后解）。所以这里
 //! 认 mpv 的 `playback-restart` 事件（寻址完成的信号），等它到了再取帧，
 //! 并且用「整块全零」而不是「平均亮度」来判断空底 —— 细节见 [`grab`]。
+//!
+//! 还有一件反直觉的事：**等寻址的时候必须一直出帧**。mpv 的渲染 API 是「外面
+//! 来取我才往下走」，干等事件、一帧都不画，它就把 seek 卡在那儿不推进。
+//!
+//! 为了让「鼠标一停就有图」，同一个桶会出**两张**：
+//! 1. 只跳到关键帧的那张（4K HDR 上 ~140ms），先顶上；
+//! 2. 用户手停了（队列空了）再补一张精确到帧的（~400ms），覆盖掉前一张。
+//!
+//! 界面那边的缓存是按键覆盖的，所以两张都往同一个键上塞就行，不用区分。
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
@@ -37,9 +46,9 @@ const QUEUE_MAX: usize = 8;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// 单帧最多等多久。超时就放弃这一格，界面继续保持「没有预览」。
 ///
-/// 这个值是按最坏情况定的：4K HDR 的片子上，一次精确定位要从关键帧一路解到
-/// 目标位置，实测 1.4 秒起步（还是多线程 + 跳过去块的情况下）。给 5 秒是留够
-/// 余量 —— 反正它只在鼠标停住时才跑，等久一点比「弹出个黑的」强。
+/// 按最坏情况定的：4K HDR 的片子上，一次精确定位要从关键帧一路解到目标位置，
+/// 实测 0.4~0.9 秒（多线程 + 跳过去块 + 边等边画之后）。给 5 秒是留够余量 ——
+/// 反正它只在鼠标停住时才跑，等久一点比「弹出个黑的」强。
 const FRAME_TIMEOUT: Duration = Duration::from_millis(5000);
 /// 连续拿到几帧「纯黑」就认定这个位置真的是黑的，别再等了。
 /// 一两帧黑是正常的（解码器还没把画面交出来，渲染上下文先画了个底色），
@@ -67,10 +76,24 @@ struct Job {
     prefetch: bool,
 }
 
+/// 定位方式。两段式抽帧就是靠它在「快」和「准」之间切换。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seek {
+    /// 只跳到最近的关键帧。4K HDR 上实测 ~140ms，但画面可能早一个 GOP
+    /// （这部片子的 GOP 是 10 秒）。
+    Keyframes,
+    /// 精确到目标帧：得从关键帧一路解过去，4K HDR 上实测 ~500ms。
+    Exact,
+}
+
 pub struct Thumbs {
     tx: Sender<Job>,
     rx: Receiver<Shot>,
     stop: Arc<AtomicBool>,
+    /// 用户每要一次就 +1。线程在抽帧途中看到它变了就知道「他挪走了」，
+    /// 立刻把手上这张（尤其是预取）扔掉 —— 抽一帧要几百毫秒，
+    /// 不打断的话新的一格就得排在它后面干等。
+    epoch: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -79,17 +102,20 @@ impl Thumbs {
         let (tx, job_rx) = channel::<Job>();
         let (out_tx, out_rx) = channel::<Shot>();
         let stop = Arc::new(AtomicBool::new(false));
+        let epoch = Arc::new(AtomicU64::new(0));
 
         let flag = stop.clone();
+        let tick = epoch.clone();
         let handle = std::thread::Builder::new()
             .name(String::from("maneki-thumbs"))
-            .spawn(move || run(job_rx, out_tx, flag))
+            .spawn(move || run(job_rx, out_tx, flag, tick))
             .map_err(|e| format!("无法创建缩略图线程：{e}"))?;
 
         Ok(Self {
             tx,
             rx: out_rx,
             stop,
+            epoch,
             handle: Some(handle),
         })
     }
@@ -98,6 +124,8 @@ impl Thumbs {
     /// 这里不做去重，省一张表。
     pub fn want(&self, path: &std::path::Path, bucket: i64) {
         let at = bucket_time(bucket);
+        // 先 +1 再入队：线程可能正在抽上一格，看到计数变了就会让路
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(Job {
             path: path.to_path_buf(),
             key: (path.to_string_lossy().into_owned(), bucket),
@@ -147,7 +175,26 @@ pub fn thumb_height(video_w: u32, video_h: u32) -> u32 {
     h.clamp(40, 120)
 }
 
-fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
+/// 把攒着的请求搬进队列。返回 false 表示界面那边已经撒手了。
+///
+/// 抽一帧要几百毫秒，这期间用户可能又扫过好几格，所以**精修之前也要再收一次**：
+/// 队列里还有新请求就说明他还在扫，这时候去精修纯属浪费。
+fn pump_requests(rx: &Receiver<Job>, queue: &mut VecDeque<Job>) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(job) => {
+                queue.push_front(job);
+                if queue.len() > QUEUE_MAX {
+                    queue.pop_back();
+                }
+            }
+            Err(TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty) => return true,
+        }
+    }
+}
+
+fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>, epoch: Arc<AtomicU64>) {
     let mut mpv: Option<Mpv> = None;
     let mut queue: VecDeque<Job> = VecDeque::new();
     let mut loaded: Option<String> = None;
@@ -165,17 +212,8 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
 
         // 新请求一律插到队头：用户刚指的那一格才是他要看的，
         // 前面排着的（他已经扫过去的）可以慢慢来，实在积压就丢掉。
-        loop {
-            match rx.try_recv() {
-                Ok(job) => {
-                    queue.push_front(job);
-                    if queue.len() > QUEUE_MAX {
-                        queue.pop_back();
-                    }
-                }
-                Err(TryRecvError::Disconnected) => return,
-                Err(TryRecvError::Empty) => break,
-            }
+        if !pump_requests(&rx, &mut queue) {
+            return;
         }
 
         let Some(job) = queue.pop_front() else {
@@ -195,6 +233,9 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
             }
             continue;
         };
+        // 记下这一刻的「用户要过几次」。抽到一半他又挪了，这个数就不再相等，
+        // 说明手上这张已经没人要了，立刻让路。
+        let my = epoch.load(Ordering::Relaxed);
         if log_enabled() {
             eprintln!("thumb job: bucket={} t={:.1} {}", job.key.1, job.at, job.path.display());
         }
@@ -241,10 +282,46 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
             continue;
         }
 
-        if let Some(shot) = grab(m, &job, size, &stop)
-            && tx.send(shot).is_err()
-        {
-            return;
+        if job.prefetch {
+            // 预取没人在看，直接一步到位求精确。
+            if let Some(shot) = grab(m, &job, size, &stop, Seek::Exact, &epoch, my)
+                && tx.send(shot).is_err()
+            {
+                return;
+            }
+        } else {
+            // 两段式：先给一张「最近的 keyframe」，再（手停了才）补一张精确的。
+            //
+            // 4K HDR 上这两档差 3~4 倍（140ms vs 500ms），而用户扫进度条时
+            // 要的是「立刻有东西看」，准不准是第二步的事。
+            let approx = grab(m, &job, size, &stop, Seek::Keyframes, &epoch, my);
+            let sent = match approx {
+                Some(shot) => tx.send(shot).is_ok(),
+                None => true, // 没抽到不算「界面没了」，接着走精修
+            };
+            if !sent {
+                return;
+            }
+
+            // 关键帧正好就是目标帧（短片、密集 I 帧）就不用再来一次了
+            let pos = m.get_f64("time-pos").unwrap_or(-1.0);
+            let off = (pos - job.at).abs();
+            let exact_enough = off <= 0.4;
+            if log_enabled() && !exact_enough {
+                eprintln!("thumb 关键帧偏差 {off:.2}s（t={:.1} 落在 {pos:.2}）", job.at);
+            }
+
+            // 队列里还压着新请求 = 用户还在扫，别精修了，先把他要看的那格给他
+            if !pump_requests(&rx, &mut queue) {
+                return;
+            }
+            if !exact_enough
+                && queue.is_empty()
+                && let Some(shot) = grab(m, &job, size, &stop, Seek::Exact, &epoch, my)
+                && tx.send(shot).is_err()
+            {
+                return;
+            }
         }
 
         // 预取出来的那一格不参与「继续往后预取」，否则会一路扫到片尾。
@@ -292,17 +369,26 @@ fn video_size(m: &Mpv) -> (u32, u32) {
 
 /// seek 到目标位置，等那张图真的画出来，再缩成缩略图。
 ///
-/// 这个函数踩过的坑值得写下来，全是「交出一张黑图」的成因：
+/// 这个函数踩过的坑值得写下来，全是「交出一张黑图」或者「慢得离谱」的成因：
 ///
 /// 1. `time-pos` 设完**立刻**就变成目标值，但画面还得从关键帧一路解过来。
 ///    这期间 mpv 会先画一帧纯黑底色。以前看完 `time-pos` 就取帧，于是在长 GOP /
 ///    4K 的片子上永远拿到那张黑帧 —— 表现就是「鼠标指哪儿都是黑的」。
 /// 2. `needs_render()` 会把「有新帧」那个**一次性**标志吃掉。暂停状态下 mpv
-///    只会在寻址完成时再发一次；要是在寻址过程中乱读，就把那唯一一次吃掉了，
-///    之后永远等不到 —— 所以「等寻址结束」这一段**一次都不能读**。
-/// 3. 因此寻址结束后不再死等标志：mpv 的渲染本来就是画「当前帧」，寻址完成后
-///    当前帧就是目标帧。等不到标志就定时硬画一帧，比干等靠谱。
-fn grab(m: &Mpv, job: &Job, size: (u32, u32), stop: &AtomicBool) -> Option<Shot> {
+///    只会在寻址完成时再发一次；要是在寻址过程中乱读，就把那唯一一次吃掉了。
+/// 3. **等寻址的时候必须一直出帧。** mpv 的渲染 API 是「外面来取我才往下走」，
+///    你干等事件、一帧都不画，它就把 seek 卡在那儿 —— 实测小文件上这一等就是
+///    200~400ms 的纯空转，等于白给。边等边画之后同一段只要十几毫秒。
+///    画的帧直接扔掉，只为了推它一把。
+fn grab(
+    m: &Mpv,
+    job: &Job,
+    size: (u32, u32),
+    stop: &AtomicBool,
+    how: Seek,
+    epoch: &AtomicU64,
+    my: u64,
+) -> Option<Shot> {
     let (vw, vh) = size;
     if vw == 0 || vh == 0 {
         return None;
@@ -313,97 +399,87 @@ fn grab(m: &Mpv, job: &Job, size: (u32, u32), stop: &AtomicBool) -> Option<Shot>
     // playback-restart，等于没等。
     let _ = m.pump_events();
 
-    m.seek_absolute(job.at);
     let start = Instant::now();
+    let deadline = start + FRAME_TIMEOUT;
+    match how {
+        Seek::Keyframes => m.seek_keyframes(job.at),
+        Seek::Exact => m.seek_absolute(job.at),
+    }
 
-    // ---- 1. 等寻址结束（全程不碰渲染上下文）----
-    //
-    // 认 `playback-restart` 这条事件，不认 `time-pos`，也不轮询 `needs_render`。
-    // 前者一设就变（画面还没解出来），后者是一次性标志，读了就没了。
-    let done = m.wait_seek_done(FRAME_TIMEOUT);
-    if stop.load(Ordering::Relaxed) {
+    // ---- 1. 边出帧边等寻址结束 ----
+    let mut buf: Vec<u8> = Vec::new();
+    let mut arrived = false;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) || (job.prefetch && epoch.load(Ordering::Relaxed) != my) {
+            return None;
+        }
+        // 这一帧只是用来推 mpv 往前走，内容扔掉
+        let _ = m.render_into(&mut buf, W, th);
+        if m.see_playback_restart() {
+            arrived = true;
+            break;
+        }
+        // 4ms 一拍就够了：再密也不能更快（实测和 1ms 一样），只会白烧 CPU
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    if !arrived {
+        if log_enabled() {
+            eprintln!("thumb 寻址超时: t={:.1} 当前位置 {:?}", job.at, m.get_f64("time-pos"));
+        }
         return None;
     }
-    if !done && log_enabled() {
-        eprintln!("thumb 寻址事件没来: t={:.1} 当前位置 {:?}", job.at, m.get_f64("time-pos"));
-    }
-    // 事件没来也往下走：定位也许已经完成、只是事件被前面清掉了，
-    // 后面还有黑帧检测兜底。
 
-    // ---- 2. 把这一帧画出来 ----
-    let mut buf: Vec<u8> = Vec::new();
+    // ---- 2. 画目标帧 ----
     let mut blanks: u32 = 0;
     loop {
-        if start.elapsed() >= FRAME_TIMEOUT {
+        if stop.load(Ordering::Relaxed) || (job.prefetch && epoch.load(Ordering::Relaxed) != my) {
+            return None;
+        }
+        if Instant::now() >= deadline {
             if log_enabled() {
                 eprintln!("thumb 等画面超时: t={:.1} 黑帧 {}", job.at, blanks);
             }
             return None;
         }
-        if stop.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        // 有「新帧」标志就等它（省得白画），但最多等 250ms —— 解码慢的时候
-        // 标志可能已经被吃掉了，这时候直接画当前帧照样能拿到目标画面。
-        let waited = Instant::now();
-        while !m.needs_render() && waited.elapsed() < Duration::from_millis(250) {
-            if stop.load(Ordering::Relaxed) {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(4));
-        }
-
         if !m.render_into(&mut buf, W, th) {
             std::thread::sleep(Duration::from_millis(4));
             continue;
         }
-
-        if log_enabled() {
-            eprintln!(
-                "  try t={:.1} {}ms pos={:?} idle={:?} vo={:?} 亮度={:.1}",
-                job.at,
-                start.elapsed().as_millis(),
-                m.get_f64("time-pos"),
-                m.get_string("core-idle"),
-                m.get_string("vo-configured"),
-                mean(&buf)
-            );
+        if !is_blank(&buf) {
+            break;
         }
-
-        if is_blank(&buf) {
-            // 解码器还没交出画面，mpv 画的是底色。再等等，但别无限等：
-            // 真·全黑的画面等多久都是黑的。
-            blanks += 1;
-            if blanks >= BLANK_TRIES {
-                if log_enabled() {
-                    eprintln!("thumb 放弃: t={:.1} 连续 {} 帧纯黑", job.at, blanks);
-                }
-                return None;
+        // 解码器还没交出画面，mpv 画的是底色。再等等，但别无限等：
+        // 真·全黑的画面等多久都是黑的。
+        blanks += 1;
+        if blanks >= BLANK_TRIES {
+            if log_enabled() {
+                eprintln!("thumb 放弃: t={:.1} 连续 {} 帧纯黑", job.at, blanks);
             }
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
+            return None;
         }
-
-        // rgb0 → rgba：mpv 交出来的第 4 个字节是填充位，iced 要的是 alpha
-        for px in buf.chunks_exact_mut(4) {
-            px[3] = 255;
-        }
-        if log_enabled() {
-            eprintln!(
-                "thumb ok: t={:.1} 用时 {}ms 平均亮度 {:.1}",
-                job.at,
-                start.elapsed().as_millis(),
-                mean(&buf)
-            );
-        }
-        return Some(Shot {
-            key: job.key.clone(),
-            w: W,
-            h: th,
-            rgba: buf,
-        });
+        std::thread::sleep(Duration::from_millis(20));
     }
+
+    // rgb0 → rgba：mpv 交出来的第 4 个字节是填充位，iced 要的是 alpha
+    for px in buf.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    if log_enabled() {
+        eprintln!(
+            "thumb ok: t={:.1} {:?} 用时 {}ms 平均亮度 {:.1} pos={:?}",
+            job.at,
+            how,
+            start.elapsed().as_millis(),
+            mean(&buf),
+            m.get_f64("time-pos"),
+        );
+    }
+    Some(Shot {
+        key: job.key.clone(),
+        w: W,
+        h: th,
+        rgba: buf,
+    })
 }
 
 /// 这张图是不是 mpv「还没画出画面」时的那张空底。

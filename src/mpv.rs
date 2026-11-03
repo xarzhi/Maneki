@@ -7,7 +7,6 @@ use libloading::Library;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr;
-use std::time::{Duration, Instant};
 
 const FORMAT_STRING: c_int = 1;
 const FORMAT_INT64: c_int = 4;
@@ -262,10 +261,10 @@ impl Mpv {
 
             // 允许用环境变量覆盖（便于对比不同硬解策略的启动开销）
             let hwdec = std::env::var("QP_HWDEC").unwrap_or_else(|_| String::from("auto-safe"));
-            // 抽帧实例一律软解：缩略图本来就是 CPU 缩放出来的，走硬解只会多一次
-            // 「解到显存再拷回来」，还容易和主播放器抢同一个解码器会话。
+            // 抽帧实例默认软解，但可以用 `QP_FRAMES_HWDEC` 覆盖 —— 4K HDR 上
+            // 硬解能不能赢过「多一次显存回拷」要靠实测，留个开关好量。
             let hwdec = if mode == Mode::Frames {
-                String::from("no")
+                std::env::var("QP_FRAMES_HWDEC").unwrap_or_else(|_| String::from("no"))
             } else {
                 hwdec
             };
@@ -634,15 +633,30 @@ impl Mpv {
         }
     }
 
-    /// 等 mpv 把「寻址完成，可以继续播」那条事件发出来。
+    /// 只跳到最后那个**不超过**目标时间的关键帧，不做精确定位。
     ///
-    /// 抽帧必须靠这条事件判断寻址结束，不能靠 `time-pos`：
-    /// `time-pos` 是**命令一发出就变**的，画面却还在从关键帧往后解。
-    /// 也不要靠轮询渲染上下文 —— `needs_render` 是一次性标志，寻址期间读掉
-    /// 就再也等不到了（暂停状态下 mpv 只在寻址完成时再发一次）。
+    /// 精确寻址（`hr-seek=yes`）要从关键帧一路解到目标帧：4K HDR 的片子上
+    /// GOP 动辄 10 秒、240 帧，实测一次 300~900ms。这条路跳过中间那些帧，
+    /// 解一个 I 帧就出画面，通常几十毫秒 —— 代价是画面最多比目标早一个 GOP。
     ///
-    /// 返回 false 表示超时或者文件已经结束（调用方自己决定要不要硬画一帧）。
-    pub fn wait_seek_done(&self, timeout: Duration) -> bool {
+    /// 所以它只适合「先给个大概」，精确帧随后再补（见 thumbs.rs 的两段式）。
+    pub fn seek_keyframes(&self, seconds: f64) {
+        let Ok(s) = CString::new(format!("{seconds}")) else {
+            return;
+        };
+        let mut args: [*const c_char; 4] = [
+            c"seek".as_ptr(),
+            s.as_ptr(),
+            c"absolute+keyframes".as_ptr(),
+            ptr::null(),
+        ];
+        unsafe {
+            (self.command)(self.ctx, args.as_mut_ptr());
+        }
+    }
+
+    /// 非阻塞地看一眼事件队列：这次没事件返回 0，否则返回 event_id。
+    pub fn try_event(&self) -> i32 {
         #[repr(C)]
         struct Ev {
             event_id: c_int,
@@ -650,21 +664,24 @@ impl Mpv {
             _reply: u64,
             _data: *mut c_void,
         }
+        let ev = unsafe { (self.wait_event)(self.ctx, 0.0) };
+        if ev.is_null() {
+            return 0;
+        }
+        unsafe { (*(ev as *const Ev)).event_id }
+    }
 
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            let ev = unsafe { (self.wait_event)(self.ctx, 0.02) };
-            if ev.is_null() {
-                continue;
-            }
-            match unsafe { (*(ev as *const Ev)).event_id } {
-                21 => return true,  // MPV_EVENT_PLAYBACK_RESTART
-                7 => return false,  // MPV_EVENT_END_FILE
-                0 => std::thread::sleep(Duration::from_millis(4)), // MPV_EVENT_NONE
+    /// 把攒着的事件一口气排空，返回有没有见到 `playback-restart`。
+    pub fn see_playback_restart(&self) -> bool {
+        let mut hit = false;
+        for _ in 0..64 {
+            match self.try_event() {
+                0 => break,
+                21 => hit = true,
                 _ => {}
             }
         }
-        false
+        hit
     }
 
     pub fn get_f64(&self, name: &str) -> Option<f64> {

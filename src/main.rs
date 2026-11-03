@@ -1418,7 +1418,11 @@ impl App {
     const TIME_W: f32 = 54.0;
 
     /// 鼠标停多久才真的去抽帧。太短的话手一扫就解一堆没人看的帧。
-    const THUMB_DWELL: Duration = Duration::from_millis(120);
+    ///
+    /// 计时是从**最后一次移动**算起的，所以手一直在扫的时候一个请求都不会发；
+    /// 80ms 大概就是「手停了」和「只是抖了一下」的分界。抽一张要 140ms
+    /// （关键帧那张），两者加起来才两百多毫秒，再短就没意义了。
+    const THUMB_DWELL: Duration = Duration::from_millis(80);
     /// 缓存上限。一格 160×90×4 ≈ 56KB，160 张不到 9MB。
     const THUMB_MAX: usize = 160;
 
@@ -1464,6 +1468,10 @@ impl App {
         // 先把线程抽好的收进来
         if let Some(t) = &self.thumbs {
             for shot in t.drain() {
+                // 同一格会来两张：先是「关键帧」那张（快但可能差几秒），
+                // 手停了再补一张精确的。后者直接覆盖前者，别重复记进 order，
+                // 不然限量淘汰的时候会把不相干的格子挤掉。
+                let fresh = !self.thumb_cache.contains_key(&shot.key);
                 let handle = iced::widget::image::Handle::from_rgba(shot.w, shot.h, shot.rgba);
                 self.thumb_cache.insert(
                     shot.key.clone(),
@@ -1473,7 +1481,9 @@ impl App {
                         h: shot.h as f32,
                     },
                 );
-                self.thumb_order.push_back(shot.key);
+                if fresh {
+                    self.thumb_order.push_back(shot.key);
+                }
             }
             // 超上限就丢最老的
             while self.thumb_order.len() > Self::THUMB_MAX {
