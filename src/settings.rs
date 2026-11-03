@@ -20,7 +20,7 @@ use iced::{
 
 use crate::icon;
 use crate::video::{Aspect, FitMode, Look};
-use crate::Message;
+use crate::{Message, audio, playlist};
 
 /// 抽屉宽度（逻辑像素）。比播放列表宽一点：这里有滑块和两排分段按钮。
 pub const W: f32 = 344.0;
@@ -367,6 +367,109 @@ fn look_row(
 
 // ---------------- 关于 ----------------
 
+/// 视频编码：libmpv 内置 FFmpeg 覆盖的主要编码。
+///
+/// 除了这里列的，FFmpeg 还有一堆老格式/采集卡格式（V210、DPX、Hap…），
+/// 但那些普通人碰不到，列出来只是噪音。
+const VIDEO_CODECS: &[&str] = &[
+    "H.264 / AVC",
+    "H.265 / HEVC",
+    "AV1",
+    "VP8",
+    "VP9",
+    "VP6",
+    "MPEG-1",
+    "MPEG-2",
+    "MPEG-4 Part 2（DivX / Xvid）",
+    "MS MPEG-4 v1/v2/v3",
+    "H.261",
+    "H.263",
+    "VC-1",
+    "WMV 7/8/9",
+    "Theora",
+    "RealVideo 1/2/3/4",
+    "ProRes",
+    "DNxHD / DNxHR",
+    "CineForm",
+    "FFV1",
+    "Huffyuv",
+    "Lagarith",
+    "Ut Video",
+    "MJPEG",
+    "JPEG 2000",
+    "DV",
+    "AVS",
+    "Dirac",
+    "Snow",
+    "Indeo 3/4/5",
+    "Cinepak",
+    "Sorenson H.263",
+    "QTRLE",
+    "MS RLE",
+];
+
+/// 音频编码：同上，只留会遇到的。
+const AUDIO_CODECS: &[&str] = &[
+    "AAC",
+    "MP3",
+    "MP2",
+    "AC-3",
+    "E-AC-3",
+    "DTS / DTS-HD",
+    "TrueHD / MLP",
+    "FLAC",
+    "ALAC",
+    "APE",
+    "WavPack",
+    "TAK",
+    "TTA",
+    "Musepack",
+    "Shorten",
+    "Vorbis",
+    "Opus",
+    "Speex",
+    "WMA v1/v2/Pro/Lossless",
+    "Cook（RealAudio）",
+    "ATRAC1/3/9",
+    "AMR-NB/WB",
+    "ADPCM",
+    "PCM（WAV / AIFF / CAF）",
+    "DSD（DSF / DFF）",
+];
+
+/// 把一串名字接成「A · B · C」。
+fn dotted(items: &[&str]) -> String {
+    items.join(" · ")
+}
+
+/// 扩展名表 → 一行大写清单。
+///
+/// `mid`/`midi` 排除在外：播放列表认这两个后缀（拖进来不会当垃圾丢掉），
+/// 但 FFmpeg 根本没有标准 MIDI 的解复用器，列在「支持」里是骗人。
+fn ext_list(exts: &[&str]) -> String {
+    let names: Vec<String> = exts
+        .iter()
+        .filter(|e| !matches!(**e, "mid" | "midi"))
+        .map(|e| e.to_ascii_uppercase())
+        .collect();
+    names.join(" · ")
+}
+
+/// 「小标题 + 一串格式」的一块。
+fn fmt_block(label: &'static str, value: String) -> Element<'static, Message> {
+    column![
+        field_label(label),
+        text(value)
+            .font(icon::UI_FONT)
+            .size(12.0)
+            .color(icon::TEXT_DIM)
+            .width(Fill),
+    ]
+    .spacing(2)
+    .width(Fill)
+    .into()
+}
+
 /// 「关于」页：技术栈、能解什么、开源地址。
 ///
 /// 内容都是编译期常量（`env!("CARGO_PKG_VERSION")` + 硬编码的清单），
@@ -406,22 +509,15 @@ fn about_tab() -> Element<'static, Message> {
     .spacing(5)
     .width(Fill);
 
+    // 封装格式直接从扫描用的白名单里取，不另抄一份：以后加格式只改那一处，
+    // 这里自动跟上，也就不会出现「关于页说支持、拖进去却打不开」。
     let formats = column![
-        field_label("容器"),
-        text("MP4 · MKV · AVI · MOV · FLV · WMV · WebM · TS · M2TS · VOB · RMVB · OGV · 3GP · MXF …")
-            .font(icon::UI_FONT)
-            .size(12.5)
-            .color(icon::TEXT_DIM)
-            .width(Fill),
-        gap(6.0),
-        field_label("编码"),
-        text("H.264 · H.265 · AV1 · VP9 · MPEG-1/2/4 · VC-1 · WMV · Theora · RealVideo · ProRes · FFV1 …")
-            .font(icon::UI_FONT)
-            .size(12.5)
-            .color(icon::TEXT_DIM)
-            .width(Fill),
+        fmt_block("视频封装", ext_list(playlist::VIDEO_EXTS)),
+        fmt_block("音频封装", ext_list(audio::AUDIO_EXTS)),
+        fmt_block("视频编码", dotted(VIDEO_CODECS)),
+        fmt_block("音频编码", dotted(AUDIO_CODECS)),
     ]
-    .spacing(2)
+    .spacing(9)
     .width(Fill);
 
     // 网址本身就是按钮的文字：抽屉只有 344 宽，再单起一行放 URL 就得滚动才能看全
@@ -445,18 +541,21 @@ fn about_tab() -> Element<'static, Message> {
     .spacing(1)
     .width(Fill);
 
+    // 顺序：技术栈 → 开源 → 格式清单。
+    // 格式清单是全写出来的（几十个名字，两千多字），一屏肯定放不下要靠滚动；
+    // 把开源地址放在它前面，才不至于点进来先找地址、滚半天才发现压在最后。
     let col = column![
         head,
         gap(12.0),
         section("技术栈"),
         tech,
         gap(12.0),
-        section("支持的视频"),
-        formats,
-        gap(12.0),
         section("开源"),
         repo,
-        gap(10.0),
+        gap(12.0),
+        section("支持的格式"),
+        formats,
+        gap(12.0),
         credit,
     ]
     .spacing(6)
