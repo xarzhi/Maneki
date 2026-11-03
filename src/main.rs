@@ -2547,9 +2547,6 @@ impl App {
             // 见 `animate`：手扫过进度条的时候不该一直解码。
             Message::BarHover(p) => {
                 self.bar_hover = self.bar_hover_at(p);
-                if std::env::var_os("QP_THUMB_LOG").is_some() {
-                    eprintln!("bar hover: p={p:?} -> {:?}", self.bar_hover.map(|h| h.bucket));
-                }
             }
             Message::BarLeave => self.bar_hover = None,
 
