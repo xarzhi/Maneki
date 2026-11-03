@@ -70,8 +70,17 @@ const ART_SIZE: f32 = 220.0;
 const ART_RADIUS: f32 = 16.0;
 /// 歌词窗：离当前行超过这么多行就彻底淡掉（再远的本来也在视口外）
 const LYRIC_FADE_ROWS: usize = 6;
-/// 歌词窗里一行占多高。定死高度，换行时整块才不会一抖一抖
+/// 歌词窗里一行**文字**占多高（含字体自带的行距）。定死高度，换行时整块才不会一抖一抖
 const LYRIC_ROW_H: f32 = 26.0;
+/// 每行额外的上下内边距：一行的最终高度是 `LYRIC_ROW_H + 2 * LYRIC_ROW_PAD`。
+///
+/// 拆成两个常量是为了调参时能分开想 —— 前者管"文字那一片多大"，后者管
+/// "行与行之间留多少白"。两个都跟着字号等比缩放（见 [`lyric_row_h`]）。
+///
+/// 注意：行高**必须**由这两个常量算出来，不能靠 content 自己撑 ——
+/// 弹簧滚动和 `lyric_line_at` 的点击命中都要用同一个值，两边一旦对不上，
+/// 点歌词就会点到隔壁那行。
+const LYRIC_ROW_PAD: f32 = 5.0;
 /// 歌词当前行的字号，以及离它一行之外的字号。
 /// 中间是**连续插值**的：某一行离正中间越近字越大，换句时一行行变大的过程
 /// 跟着整列的弹簧一起走（AMLL 里那行放大也是按距离算的，不是「到点啪一下变大」）。
@@ -1249,7 +1258,7 @@ impl App {
             return None;
         }
 
-        let row_h = LYRIC_ROW_H * (self.lyric_size / LYRIC_SIZE_IDLE);
+        let row_h = lyric_row_h(self.lyric_size);
         if row_h <= 0.0 {
             return None;
         }
@@ -3237,8 +3246,9 @@ fn lyrics_view<'a>(
 ) -> Element<'a, Message> {
     // 一行歌词最多这么宽：留 8px 给右边，免得贴着栏边
     let budget = (width - 8.0).max(40.0);
-    // 行高跟着字号一起缩放，不然调大字号之后行会挤在一起（默认 26/13.5 ≈ 1.93 倍）
-    let row_h = LYRIC_ROW_H * (size / LYRIC_SIZE_IDLE);
+    // 行高跟着字号一起缩放，不然调大字号之后行会挤在一起。
+    // 里面已经含了 `LYRIC_ROW_PAD` 的上下内边距。
+    let row_h = lyric_row_h(size);
 
     let Some(lyrics) = lyrics else {
         return container(lyrics_hint(
@@ -3388,6 +3398,15 @@ fn wheel_rows(delta: mouse::ScrollDelta) -> f32 {
         // 40 像素 ≈ 鼠标滚轮一格（winit 自己也按这个量级折算）
         mouse::ScrollDelta::Pixels { y, .. } => -y / 40.0 * LYRIC_WHEEL_ROWS,
     }
+}
+
+/// 当前字号下，一行歌词占多高（文字 + 上下内边距）。
+///
+/// **所有跟"行"有关的几何都得走这里**：`lyrics_view` 排版、`lyric_layout` 算
+/// 起始行、`lyric_line_at` 反算点中了第几行。三处各写一遍迟早会对不上，
+/// 那时候症状是「点歌词跳到隔壁一行」，很难看出来是行高不一致。
+fn lyric_row_h(size: f32) -> f32 {
+    (LYRIC_ROW_H + LYRIC_ROW_PAD * 2.0) * (size / LYRIC_SIZE_IDLE)
 }
 
 /// 同步歌词要「从第几行开始画」和「顶部留白多高」。
