@@ -4,6 +4,7 @@
 
 mod assoc;
 mod audio;
+mod hide_cursor;
 mod icon;
 mod info;
 mod meta;
@@ -33,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use hide_cursor::HideCursor;
 use player::{Cmd, Player};
 use playlist::Playlist;
 use settings::{Field, Settings, Tab};
@@ -324,6 +326,9 @@ enum Message {
     MouseMoved(Point),
     MouseEntered,
     MouseLeft,
+    /// 窗口拿到 / 丢掉焦点了。丢了焦点时指针必须立刻放出来：`ShowCursor` 是
+    /// 桌面级的，窗口在后台却还藏着指针，用户去点别的窗口就找不着箭头了。
+    Focused(bool),
     Resized(Size),
     /// 在歌词区滚了滚轮，正数 = 往下滚一行（已经换算成"行"了，见 `wheel_rows`）
     LyricWheel(f32),
@@ -482,6 +487,11 @@ struct App {
     win_size: Size,
     muted_before: f64,
     fullscreen: bool,
+    /// 窗口现在有焦点吗？没焦点时不藏指针（见 `cursor_idle`）
+    focused: bool,
+    /// 上一帧有没有把指针藏起来。只用来在 debug 下打一行状态变化，好确认
+    /// 「静置 2 秒」这条规则真的按时翻了面
+    cursor_hidden: bool,
     /// 音量 popover 是否展开
     volume_popover: bool,
     /// 字幕 popover 是否展开
@@ -614,6 +624,8 @@ impl App {
             win_size: Size::new(1180.0, 720.0),
             muted_before: 80.0,
             fullscreen: false,
+            focused: true,
+            cursor_hidden: false,
             volume_popover: false,
             sub_popover: false,
             topmost: false,
@@ -989,6 +1001,45 @@ impl App {
             || self.context.is_some()
             || self.last_active.elapsed() < HIDE_AFTER
             || self.cursor_over_bars()
+    }
+
+    /// 全屏静置够久 → 该把鼠标指针藏起来了。
+    ///
+    /// 用的是和两条栏**同一个时钟**（`last_active` + `HIDE_AFTER`）：栏往上滑走的
+    /// 那一帧，指针也一起消失，画面上就只剩片子本身。两件事要是一直分开算，
+    /// 迟早出现「栏还在、箭头先没了」或者反过来这种别扭的一瞬间。
+    ///
+    /// 四个条件缺一不可：
+    ///
+    /// - **全屏**：窗口态下藏指针没有任何好处，用户还要点边上的东西。
+    /// - **有焦点**：`ShowCursor` 是桌面级的，窗口在后台还藏着指针，用户切到别的
+    ///   窗口就会看见一个"没有箭头"的桌面。
+    /// - **指针在窗口里**（`cursor.is_some()`）：鼠标已经出去了就不该由我们说了算。
+    /// - **静置超过 `HIDE_AFTER`**：任何一次触摸 / 按键都会 `touch()` 把时钟拨回来。
+    fn cursor_idle(&self) -> bool {
+        self.fullscreen
+            && self.focused
+            && self.cursor.is_some()
+            && self.last_active.elapsed() >= HIDE_AFTER
+    }
+
+    /// 指针该不该藏，只在**翻面那一帧**打一行日志：这样验收「静置 2 秒」这条
+    /// 规则时，能直接看时间点，不用靠肉眼盯屏幕。跟 `audio-seek` 那行一个路数，
+    /// 只在 debug 版存在。
+    fn note_cursor_state(&mut self) {
+        let now = self.cursor_idle();
+        if now != self.cursor_hidden {
+            self.cursor_hidden = now;
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "cursor-idle: {} (全屏={} 有焦点={} 指针在窗口里={} 静置={:?})",
+                if now { "藏起来" } else { "放出来" },
+                self.fullscreen,
+                self.focused,
+                self.cursor.is_some(),
+                self.last_active.elapsed()
+            );
+        }
     }
 
     /// 有没有抽屉（播放列表 / 设置 / 详情）正开着或在动画里 —— 决定要不要铺那层透明 cover
@@ -1717,7 +1768,10 @@ impl App {
         }
 
         match message {
-            Message::Tick => self.tick(),
+            Message::Tick => {
+                self.tick();
+                self.note_cursor_state();
+            }
 
             Message::OpenDialog => {
                 self.touch();
@@ -1949,6 +2003,12 @@ impl App {
                 self.stage_press = false;
                 // 从「离开窗口这一刻」开始重新计时：2 秒后收起，
                 // 而不是接着上一次鼠标移动的时间算（那样刚移出去就立刻收起）。
+                self.touch();
+            }
+            Message::Focused(on) => {
+                self.focused = on;
+                // 重新拿到焦点时把时钟拨回来：不然切回来第一帧指针就没了，
+                // 用户还以为没切回来
                 self.touch();
             }
 
@@ -2235,6 +2295,10 @@ impl App {
                     Some(Message::Dropped(p))
                 }
                 iced::Event::Window(iced::window::Event::Resized(s)) => Some(Message::Resized(s)),
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focused(true)),
+                iced::Event::Window(iced::window::Event::Unfocused) => {
+                    Some(Message::Focused(false))
+                }
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Message::MouseMoved(position))
                 }
@@ -2280,6 +2344,13 @@ impl App {
     // ---------------- 视图 ----------------
 
     fn view(&self) -> Element<'_, Message> {
+        // 只在这里包一层：`HideCursor` 必须是**根组件**，它报出来的指针样式才会
+        // 直接送到窗口上。塞在别处（比如内容上面盖一层）会把下面所有组件的悬停
+        // 和点击都挡掉 —— 原因写在 `hide_cursor.rs` 头上。
+        Element::new(HideCursor::new(self.view_body(), self.cursor_idle()))
+    }
+
+    fn view_body(&self) -> Element<'_, Message> {
         // 字体排查用：QP_FONT_TEST=1 启动时显示一张字样对照表（见 font_specimen）
         if std::env::var_os("QP_FONT_TEST").is_some() {
             return font_specimen();
@@ -4966,6 +5037,62 @@ mod tests {
         app.frame = None;
         app.last_active = Instant::now() - HIDE_AFTER - Duration::from_millis(50);
         assert!(app.want_bars(), "空白页上栏不能收");
+    }
+
+    /// 全屏 + 静置 2 秒 → 指针藏起来；四个条件里缺任何一个都不该藏。
+    ///
+    /// 每条都写出来是因为「藏错了」的后果不对等：藏早了/藏错了地方，
+    /// 用户面对的是一个没有箭头的桌面（`ShowCursor` 是全局的），比不藏严重得多。
+    #[test]
+    fn cursor_hides_only_when_fullscreen_focused_and_idle() {
+        let mut app = app();
+        app.cursor = Some(Point::new(600.0, 400.0));
+        app.fullscreen = true;
+        app.focused = true;
+        app.last_active = Instant::now() - HIDE_AFTER - Duration::from_millis(50);
+        assert!(app.cursor_idle(), "全屏 + 有焦点 + 静置够了，该藏");
+
+        // 刚动过鼠标：不能藏
+        app.last_active = Instant::now();
+        assert!(!app.cursor_idle(), "刚动过鼠标不能立刻藏");
+        app.last_active = Instant::now() - HIDE_AFTER + Duration::from_millis(50);
+        assert!(!app.cursor_idle(), "还差一点点到 2 秒，也别藏");
+
+        // 窗口态：不藏
+        app.last_active = Instant::now() - HIDE_AFTER - Duration::from_millis(50);
+        app.fullscreen = false;
+        assert!(!app.cursor_idle(), "窗口态下不藏指针");
+
+        // 丢了焦点：不藏 —— 用户可能正在别的窗口上点东西
+        app.fullscreen = true;
+        app.focused = false;
+        assert!(!app.cursor_idle(), "窗口在后台时不能藏");
+
+        // 指针已经移出窗口：不归我们管
+        app.focused = true;
+        app.cursor = None;
+        assert!(!app.cursor_idle(), "指针不在窗口里就不该由我们藏");
+    }
+
+    /// 状态翻转只在真的翻面时发生一次：`note_cursor_state` 靠它打日志，
+    /// 每帧都翻或者不翻都说明判断写错了。
+    #[test]
+    fn cursor_state_flips_once_per_change() {
+        let mut app = app();
+        app.cursor = Some(Point::new(600.0, 400.0));
+        app.fullscreen = true;
+        app.last_active = Instant::now() - HIDE_AFTER - Duration::from_millis(50);
+
+        app.note_cursor_state();
+        assert!(app.cursor_hidden);
+        // 再算一遍：还是同一个状态，不该重复处理
+        app.note_cursor_state();
+        assert!(app.cursor_hidden);
+
+        // 动一下鼠标，马上放出来
+        app.last_active = Instant::now();
+        app.note_cursor_state();
+        assert!(!app.cursor_hidden);
     }
 
     /// 转圈的相位只在换片期间往前走，转满一圈要回到 0（不然浮点数会越加越大）

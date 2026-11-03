@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced = { version = "0.14.0", features = ["image-without-codecs", "tokio", "canvas"] }
+# `advanced` 是为了写那唯一一个自定义组件（`src/hide_cursor.rs`）：全屏静置时
+# 藏鼠标指针。它只是把 iced 内部已经在用的 widget 接口暴露出来，不多拉任何依赖。
+iced = { version = "0.14.0", features = ["image-without-codecs", "tokio", "canvas", "advanced"] }
 libloading = "0.9.0"
 rfd = "0.17.2"
 # 音频播放（视频和其余音频格式还是 libmpv；rodio 只管纯音频，省得为了一首歌
