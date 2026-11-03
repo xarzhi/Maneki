@@ -65,8 +65,21 @@ const LYRIC_ROW_H: f32 = 26.0;
 /// 歌词当前行的字号，以及离它一行之外的字号。
 /// 中间是**连续插值**的：某一行离正中间越近字越大，换句时一行行变大的过程
 /// 跟着整列的弹簧一起走（AMLL 里那行放大也是按距离算的，不是「到点啪一下变大」）。
+/// 这两个是**默认值**，Ctrl + 滚轮调完字号之后由 `App::lyric_size` 缩放。
 const LYRIC_SIZE_ACTIVE: f32 = 17.0;
 const LYRIC_SIZE_IDLE: f32 = 13.5;
+/// 歌词字号能调到的范围（常态行的字号，单位 pt）。再小看不清，再大一行就放不下几个字了。
+const LYRIC_SIZE_MIN: f32 = 10.5;
+const LYRIC_SIZE_MAX: f32 = 21.0;
+/// Ctrl + 滚轮一格调多少字号
+const LYRIC_SIZE_STEP: f32 = 0.5;
+/// 滚轮一格滚几行歌词
+const LYRIC_WHEEL_ROWS: f32 = 2.0;
+/// 手动滚完停这么久，自动滑回「正在唱的那一句」。
+///
+/// 不自动回的话，用户滚过去看一眼后面的词，就再也回不到正在唱的位置（除非正好
+/// 又滚回来）—— 一个只有七行的歌词窗，这太容易迷路了。四秒够看完后面几句。
+const LYRIC_BROWSE_HOLD: Duration = Duration::from_secs(4);
 /// 目标一下跳得比这还远（拖进度条、刚换歌）就别弹了，直接落位。
 ///
 /// 一句一句往上唱着走，弹簧那点过冲是味道；可要是从第 2 句直接跳到第 40 句，
@@ -282,6 +295,12 @@ enum Message {
     MouseEntered,
     MouseLeft,
     Resized(Size),
+    /// 在歌词区滚了滚轮，正数 = 往下滚一行（已经换算成"行"了，见 `wheel_rows`）
+    LyricWheel(f32),
+    /// 点了第几行歌词：跳到那一句
+    LyricSeek(usize),
+    /// 修饰键变了（只关心 Ctrl 按没按着 —— 它决定滚轮是调字号还是滚歌词）
+    Modifiers(bool),
     /// 在画面上按下左键（只有真的按在画面上才会来，按在顶底栏会被它们先吃掉）
     StagePress,
     /// 在画面上松开左键
@@ -391,6 +410,24 @@ struct App {
     /// 用弹簧而不是指数逼近还有一个好处：连唱两句间隔很短时，弹簧带着速度
     /// 直接接上，整列是"一路滑过去"，不会每句都停一下再起步。
     lyric_scroll: spring::Spring,
+    /// 歌词常态行的字号（pt）。Ctrl + 滚轮在 `LYRIC_SIZE_MIN..=LYRIC_SIZE_MAX` 之间调。
+    lyric_size: f32,
+    /// 手动滚动的**额外偏移**（单位"行"，0 = 正好跟着当前句）。
+    ///
+    /// 显示位置 = `lyric_scroll + lyric_browse`：`lyric_scroll` 一直在跟着唱到哪句走，
+    /// 滚轮只叠一个偏移上去，所以滚完四秒（`LYRIC_BROWSE_HOLD`）自动滑回 0 就
+    /// 又跟上了，不需要记"刚才滚到第几行"。
+    lyric_browse: spring::Spring,
+    /// 最后一次手动滚歌词是什么时候（超时就归零，见 `animate_with`）
+    lyric_browse_at: Option<Instant>,
+    /// 手动浏览时**钉住**的显示位置（第几行在中间）。
+    ///
+    /// 只靠 `lyric_browse` 那个偏移是不够的：播放会继续往前唱，`lyric_scroll` 一走，
+    /// 视图就跟着漂 —— 用户滚上去看第一句，两秒后它自己变成第二句。
+    /// 所以浏览期间每帧用这个值反算偏移（`pin - scroll`），把画面钉在原地。
+    lyric_pin: Option<f32>,
+    /// Ctrl 现在按着没有。有它滚轮是「调字号」，没有才是「滚歌词」。
+    ctrl: bool,
     /// 后台读标签的线程（第一次播音频时才创建，不拖慢启动）
     tag_loader: Option<meta::Loader>,
     paused: bool,
@@ -531,6 +568,11 @@ impl App {
             cover: None,
             lyric_line: None,
             lyric_scroll: spring::Spring::bouncy(0.0),
+            lyric_size: LYRIC_SIZE_IDLE,
+            lyric_browse: spring::Spring::smooth(0.0),
+            lyric_browse_at: None,
+            lyric_pin: None,
+            ctrl: false,
             tag_loader: None,
             paused: true,
             pause_sent: None,
@@ -674,6 +716,9 @@ impl App {
         self.cover = None;
         self.lyric_line = None;
         self.lyric_scroll.snap(0.0);
+        self.lyric_browse.snap(0.0);
+        self.lyric_browse_at = None;
+        self.lyric_pin = None;
         if audio::is_audio(&path) {
             if self.tag_loader.is_none() {
                 self.tag_loader = meta::Loader::spawn();
@@ -720,6 +765,9 @@ impl App {
         self.cover = None;
         self.lyric_line = None;
         self.lyric_scroll.snap(0.0);
+        self.lyric_browse.snap(0.0);
+        self.lyric_browse_at = None;
+        self.lyric_pin = None;
         // 代次也往前推一格：在途的旧快照（还是上一条片子的画面/进度）一律不认，
         // 否则刚清空的界面会被它们重新填回旧数字。
         self.load_gen = self.load_gen.wrapping_add(1);
@@ -1005,6 +1053,21 @@ impl App {
             self.lyric_scroll.set_target(target);
         }
         self.lyric_scroll.tick(dt);
+
+        // 手动滚过去看后面的词：每帧把画面**钉住**（播放继续往前唱，视图不动），
+        // 四秒不再滚就滑回正在唱的那一句。
+        if let Some(pin) = self.lyric_pin {
+            self.lyric_browse.set_target(pin - self.lyric_scroll.value());
+        }
+        if self
+            .lyric_browse_at
+            .is_some_and(|at| at.elapsed() > LYRIC_BROWSE_HOLD)
+        {
+            self.lyric_browse_at = None;
+            self.lyric_pin = None;
+            self.lyric_browse.set_target(0.0);
+        }
+        self.lyric_browse.tick(dt);
     }
 
     /// 换片转圈现在的不透明度（0 = 不画，1 = 完全显示）。
@@ -1113,6 +1176,53 @@ impl App {
             return;
         };
         self.lyric_line = lyrics.index_at(self.position);
+    }
+
+    /// 滚轮滚歌词：在「跟着当前句」的偏移上叠一行数，两头都夹住。
+    ///
+    /// 允许的范围就是「第 0 行能滚到中线」到「最后一行能滚到中线」——
+    /// 再往外滚就是一片空白，没意义。
+    fn scroll_lyrics(&mut self, rows: f32) {
+        let Some(meta::Lyrics::Synced(lines)) = &self.tags.lyrics else {
+            return;
+        };
+        if lines.is_empty() || rows == 0.0 {
+            return;
+        }
+        let scroll = self.lyric_scroll.value();
+        let last = (lines.len() - 1) as f32;
+        // 夹的是**显示位置**（scroll + 偏移），不是偏移本身：夹偏移的话，
+        // 顶到边界之后播放再往前走一句，显示位置就又"漂"出边界了。
+        let shown = self.lyric_pin.unwrap_or(scroll + self.lyric_browse.value());
+        let next = (shown + rows).clamp(0.0, last);
+        self.lyric_pin = Some(next);
+        self.lyric_browse.set_target(next - scroll);
+        self.lyric_browse_at = Some(Instant::now());
+        self.touch();
+    }
+
+    /// 点了某一行歌词：跳到那一句唱的地方。
+    ///
+    /// 歌词位置直接 `snap` 过去 —— 用户点这句就是想看这句，让它从上一句慢慢滑过来
+    /// 反而莫名其妙（而且可能跨十几行）。
+    fn seek_to_lyric(&mut self, index: usize) {
+        let Some(meta::Lyrics::Synced(lines)) = &self.tags.lyrics else {
+            return;
+        };
+        let Some(line) = lines.get(index) else {
+            return;
+        };
+        let at = line.at;
+        self.touch();
+        self.position = at;
+        // 和方向键快进同一个套路：先记时刻，免得下一帧被还没跟上来的旧快照拽回去
+        self.seek_at = Some(Instant::now());
+        self.send(Cmd::Seek(at));
+        self.lyric_line = Some(index);
+        self.lyric_scroll.snap(index as f32);
+        self.lyric_browse.snap(0.0);
+        self.lyric_browse_at = None;
+        self.lyric_pin = None;
     }
 
     fn touch(&mut self) {
@@ -2056,6 +2166,19 @@ impl App {
                 self.win_size = s;
                 self.touch();
             }
+            Message::Modifiers(ctrl) => self.ctrl = ctrl,
+            Message::LyricWheel(rows) => {
+                if self.ctrl {
+                    // 按着 Ctrl：调字号。向上滚放大（和浏览器一致），一格 0.5pt，
+                    // 两头都夹住 —— 再小看不清，再大一行放不下几个字。
+                    // 注意 `rows` 是"显示位置增量"，向上滚是负的，所以这里取反。
+                    self.lyric_size = (self.lyric_size - rows * LYRIC_SIZE_STEP)
+                        .clamp(LYRIC_SIZE_MIN, LYRIC_SIZE_MAX);
+                } else {
+                    self.scroll_lyrics(rows);
+                }
+            }
+            Message::LyricSeek(index) => self.seek_to_lyric(index),
             // 栏 / 覆盖层故意「吃掉」按下事件用的占位消息，到这里什么也不做
             Message::Noop => {}
         }
@@ -2077,6 +2200,10 @@ impl App {
                     Some(Message::MouseEntered)
                 }
                 iced::Event::Mouse(iced::mouse::Event::CursorLeft) => Some(Message::MouseLeft),
+                // 只关心 Ctrl：它决定歌词区的滚轮是「调字号」还是「滚歌词」
+                iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                    Some(Message::Modifiers(m.control()))
+                }
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, repeat, .. }) => {
                     match key {
                         // 空格是「切一下」，按住不放会疯狂切，所以只认第一次
@@ -2537,9 +2664,11 @@ impl App {
         let right = container(lyrics_view(
             self.tags.lyrics.as_ref(),
             self.lyric_line,
-            self.lyric_scroll.value(),
+            // 显示位置 = 跟随当前句的弹簧 + 用户滚轮叠的偏移
+            self.lyric_scroll.value() + self.lyric_browse.value(),
             text_w,
             panel_h,
+            self.lyric_size,
         ))
         .width(Length::Fixed(right_w))
         .height(Length::Fixed(panel_h))
@@ -3034,22 +3163,29 @@ impl App {
 
 /// 歌词面板：三种情况各画各的。
 ///
-/// - **同步歌词**：整列每行 `LYRIC_ROW_H` 高的文字，外面套一个 `clip(true)` 的
+/// - **同步歌词**：整列每行 `row_h` 高的文字，外面套一个 `clip(true)` 的
 ///   固定尺寸容器，靠**顶部留白**把当前行顶到容器中线上。留白是连续值
 ///   （`scroll` 可以是小数），所以换句时整块是平滑往上滑，不是一格一格跳。
 ///   （iced 没有「滚到某一行」的直给接口，自己算留白反而最省事，也不会冒出
 ///   滚动条、惯性这些东西抢戏。）
+///   这一支上还挂了两个鼠标交互：滚轮滚歌词、点某一行跳过去播放。
 /// - **纯文本歌词**：没有时间轴对不了行，就给一个能自己滚的列表。
 /// - **没有歌词**：说一句，别留一块空白让人以为界面挂了。
+///
+/// `scroll` 是**显示位置**（第几行贴在中线上）：自动跟随的那条弹簧加上用户
+/// 滚轮叠的偏移，见 `App::lyric_browse`。`size` 是常态行字号（Ctrl + 滚轮调）。
 fn lyrics_view<'a>(
     lyrics: Option<&'a meta::Lyrics>,
     current: Option<usize>,
     scroll: f32,
     width: f32,
     height: f32,
+    size: f32,
 ) -> Element<'a, Message> {
     // 一行歌词最多这么宽：留 8px 给右边，免得贴着栏边
     let budget = (width - 8.0).max(40.0);
+    // 行高跟着字号一起缩放，不然调大字号之后行会挤在一起（默认 26/13.5 ≈ 1.93 倍）
+    let row_h = LYRIC_ROW_H * (size / LYRIC_SIZE_IDLE);
 
     let Some(lyrics) = lyrics else {
         return container(lyrics_hint(
@@ -3095,9 +3231,9 @@ fn lyrics_view<'a>(
             // 第一句真的唱出来时只有颜色变化，整块歌词不会先跳一格子。
             let lit = current.is_some();
 
-            let (first, pad) = lyric_layout(scroll, height);
+            let (first, pad) = lyric_layout(scroll, height, row_h);
             // 容器里放得下几行，多给两行当过渡用
-            let count = (height / LYRIC_ROW_H).ceil() as usize + 2;
+            let count = (height / row_h).ceil() as usize + 2;
 
             let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(count + 1);
             rows.push(space().height(Length::Fixed(pad)).into());
@@ -3108,34 +3244,44 @@ fn lyrics_view<'a>(
                 // 而不是"到点啪一下"跳档 —— AMLL 也是按距离插值的。
                 let d = (i as f32 - scroll).abs();
                 let alpha = lyric_alpha(d, lit);
-                let size = lyric_size(d);
+                let px = lyric_size(d, size);
 
+                let row = container(
+                    text(ui::elide(&lines[i].text, budget, px))
+                        .font(if d < 0.5 {
+                            icon::UI_BOLD
+                        } else {
+                            icon::UI_FONT
+                        })
+                        .size(px)
+                        .color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
+                        .width(Fill)
+                        .align_x(Horizontal::Center),
+                )
+                .height(Length::Fixed(row_h))
+                .width(Fill)
+                .align_y(Vertical::Center);
+
+                // 点这一行就跳到这句唱的地方。手型光标提示「这里能点」——
+                // 不然谁知道歌词还能点。
                 rows.push(
-                    container(
-                        text(ui::elide(&lines[i].text, budget, size))
-                            .font(if d < 0.5 {
-                                icon::UI_BOLD
-                            } else {
-                                icon::UI_FONT
-                            })
-                            .size(size)
-                            .color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
-                            .width(Fill)
-                            .align_x(Horizontal::Center),
-                    )
-                    .height(Length::Fixed(LYRIC_ROW_H))
-                    .width(Fill)
-                    .align_y(Vertical::Center)
-                    .into(),
+                    mouse_area(row)
+                        .interaction(mouse::Interaction::Pointer)
+                        .on_press(Message::LyricSeek(i))
+                        .into(),
                 );
             }
 
-            // clip：滑到一半时，上下溢出的行不能画到容器外面去
-            container(column(rows).width(Fill))
-                .width(Length::Fixed(width))
-                .height(Length::Fixed(height))
-                .clip(true)
-                .into()
+            // clip：滑到一半时，上下溢出的行不能画到容器外面去。
+            // 外面再套一层 mouse_area 专门接滚轮（行的 on_press 在内层，互不影响）。
+            mouse_area(
+                container(column(rows).width(Fill))
+                    .width(Length::Fixed(width))
+                    .height(Length::Fixed(height))
+                    .clip(true),
+            )
+            .on_scroll(|delta| Message::LyricWheel(wheel_rows(delta)))
+            .into()
         }
     }
 }
@@ -3170,11 +3316,25 @@ fn lyric_alpha(d: f32, lit: bool) -> f32 {
 
 /// 离正中间 `d` 行的那一行用多大字号。
 ///
-/// 正中间 `LYRIC_SIZE_ACTIVE`，一行开外就回到 `LYRIC_SIZE_IDLE`，中间线性插值。
-/// 换句时旧行缩回、新行长大是跟着弹簧一起走的，不是分档跳。
-fn lyric_size(d: f32) -> f32 {
+/// 正中间是常态字号 `base` 的 `LYRIC_SIZE_ACTIVE / LYRIC_SIZE_IDLE` 倍（默认 1.26），
+/// 一行开外就回到 `base`，中间线性插值。换句时旧行缩回、新行长大是跟着弹簧一起走的，
+/// 不是分档跳。`base` 由 Ctrl + 滚轮调（`App::lyric_size`）。
+fn lyric_size(d: f32, base: f32) -> f32 {
     let t = d.clamp(0.0, 1.0);
-    LYRIC_SIZE_IDLE + (LYRIC_SIZE_ACTIVE - LYRIC_SIZE_IDLE) * (1.0 - t)
+    let active = base * (LYRIC_SIZE_ACTIVE / LYRIC_SIZE_IDLE);
+    base + (active - base) * (1.0 - t)
+}
+
+/// 滚轮一格算滚几行。
+///
+/// winit 在触摸板 / 高精度滚轮上发的是 `Pixels`（连续），鼠标滚轮发 `Lines`
+/// （一格一格）。两种都换算成"行"，下面 `scroll_lyrics` 只认行。
+fn wheel_rows(delta: mouse::ScrollDelta) -> f32 {
+    match delta {
+        mouse::ScrollDelta::Lines { y, .. } => -y * LYRIC_WHEEL_ROWS,
+        // 40 像素 ≈ 鼠标滚轮一格（winit 自己也按这个量级折算）
+        mouse::ScrollDelta::Pixels { y, .. } => -y / 40.0 * LYRIC_WHEEL_ROWS,
+    }
 }
 
 /// 同步歌词要「从第几行开始画」和「顶部留白多高」。
@@ -3184,10 +3344,12 @@ fn lyric_size(d: f32) -> f32 {
 /// 起始行要跟着 `scroll` 一起往前挪 —— `scroll` 走一行，`first` 也走一行。
 ///
 /// 返回值保证：`pad >= 0`，且第 `scroll` 行的顶边正好在 `height/2 - 行高/2`。
-fn lyric_layout(scroll: f32, height: f32) -> (usize, f32) {
-    let half = height * 0.5 - LYRIC_ROW_H * 0.5;
-    let first = (scroll - half / LYRIC_ROW_H).ceil().max(0.0) as usize;
-    let pad = (half - (scroll - first as f32) * LYRIC_ROW_H).max(0.0);
+///
+/// `row_h` 是**当前字号下一个行占多高**（Ctrl + 滚轮调字号时会变，见 `lyrics_view`）。
+fn lyric_layout(scroll: f32, height: f32, row_h: f32) -> (usize, f32) {
+    let half = height * 0.5 - row_h * 0.5;
+    let first = (scroll - half / row_h).ceil().max(0.0) as usize;
+    let pad = (half - (scroll - first as f32) * row_h).max(0.0);
     (first, pad)
 }
 
@@ -4264,7 +4426,7 @@ mod tests {
             // 0 → 30 行，每帧推进 0.1 行（比 60fps 下的真实速度还慢，够密了）
             for step in 0..=300 {
                 let scroll = step as f32 * 0.1;
-                let (first, pad) = lyric_layout(scroll, height);
+                let (first, pad) = lyric_layout(scroll, height, LYRIC_ROW_H);
 
                 assert!(pad >= 0.0, "留白不能是负的（iced 没有负 padding）");
 
@@ -4385,6 +4547,171 @@ mod tests {
         );
     }
 
+    /// 手动滚上去看词的时候，视图要**钉住**：播放继续往前唱，画面不能自己往下漂。
+    /// 四秒没人滚，再滑回正在唱的那一句。
+    #[test]
+    fn browsing_pins_the_view_and_then_comes_back() {
+        let mut app = app();
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..10)
+                .map(|i| meta::Line {
+                    at: i as f64 * 5.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(2);
+        app.lyric_scroll.snap(2.0);
+
+        // 往上滚一句，停在第 0 句
+        app.scroll_lyrics(-2.0);
+        for _ in 0..90 {
+            app.animate();
+        }
+        let shown = |a: &App| a.lyric_scroll.value() + a.lyric_browse.value();
+        assert!((shown(&app) - 0.0).abs() < 0.05, "没滚到顶：{}", shown(&app));
+
+        // 播放往前唱了两句：视图要还在原处
+        app.lyric_line = Some(4);
+        for _ in 0..90 {
+            app.animate();
+        }
+        assert!(
+            (shown(&app) - 0.0).abs() < 0.05,
+            "浏览的时候被播放拖着走了：{}",
+            shown(&app)
+        );
+
+        // 四秒没人动它，自己滑回当前句
+        app.lyric_browse_at = Some(Instant::now() - LYRIC_BROWSE_HOLD - Duration::from_millis(20));
+        for _ in 0..120 {
+            app.animate();
+        }
+        assert!(
+            (shown(&app) - 4.0).abs() < 0.1,
+            "超时之后应该回到正在唱的那句：{}",
+            shown(&app)
+        );
+    }
+
+    /// 滚轮滚歌词：滚到第一句 / 最后一句就顶住，不能滚出一片空白。
+    ///
+    /// 「显示位置」= 跟随当前句的 `lyric_scroll` + 滚轮叠的 `lyric_browse`，
+    /// 允许的范围是 `0 ..= 最后一行`。
+    #[test]
+    fn scrolling_lyrics_clamps_at_both_ends() {
+        let mut app = app();
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..10)
+                .map(|i| meta::Line {
+                    at: i as f64 * 5.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(4);
+        app.lyric_scroll.snap(4.0);
+
+        let shown = |app: &App| app.lyric_scroll.value() + app.lyric_browse.target();
+
+        // 一个劲儿往下滚：最后一行贴中线就该停住
+        for _ in 0..20 {
+            app.scroll_lyrics(5.0);
+        }
+        assert_eq!(shown(&app), 9.0, "滚过头了，最后一行之后不该还有内容");
+
+        // 再往上滚到头：第一行贴中线
+        for _ in 0..40 {
+            app.scroll_lyrics(-5.0);
+        }
+        assert_eq!(shown(&app), 0.0, "滚到顶之后不该继续往负数走");
+    }
+
+    /// Ctrl + 滚轮调字号，两头都有硬限制（再小看不清、再大放不下）。
+    #[test]
+    fn ctrl_wheel_resizes_lyrics_within_limits() {
+        let mut app = app();
+        assert_eq!(app.lyric_size, LYRIC_SIZE_IDLE);
+
+        app.ctrl = true;
+        // 向上滚（`LyricWheel` 里是负的行数）放大
+        for _ in 0..80 {
+            let _ = app.update(Message::LyricWheel(-1.0));
+        }
+        assert_eq!(app.lyric_size, LYRIC_SIZE_MAX, "字号没有上限");
+
+        for _ in 0..200 {
+            let _ = app.update(Message::LyricWheel(1.0));
+        }
+        assert_eq!(app.lyric_size, LYRIC_SIZE_MIN, "字号没有下限");
+    }
+
+    /// 不按 Ctrl 的滚轮只滚歌词，不许偷偷把字号改了。
+    #[test]
+    fn plain_wheel_scrolls_lyrics_and_leaves_the_size_alone() {
+        let mut app = app();
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..10)
+                .map(|i| meta::Line {
+                    at: i as f64 * 5.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(4);
+        app.lyric_scroll.snap(4.0);
+        app.ctrl = false;
+
+        let _ = app.update(Message::LyricWheel(-2.0));
+        assert_eq!(app.lyric_size, LYRIC_SIZE_IDLE, "滚歌词不该动字号");
+        assert!(
+            app.lyric_browse.target() < 0.0,
+            "往上滚应该看到前面的词（偏移为负）"
+        );
+    }
+
+    /// 点某一行歌词：播放跳过去，歌词也当场对到那一句（不用弹簧慢慢滑）。
+    #[test]
+    fn clicking_a_line_seeks_playback_there() {
+        let mut app = app();
+        app.current = Some(PathBuf::from("song.mp3"));
+        app.duration = 100.0;
+        app.position = 3.0;
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..4)
+                .map(|i| meta::Line {
+                    at: i as f64 * 10.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(0);
+        app.lyric_scroll.snap(0.0);
+        // 假装用户刚滚到别处看过
+        app.lyric_browse.set_target(2.0);
+
+        let _ = app.update(Message::LyricSeek(3));
+
+        assert_eq!(app.position, 30.0, "要跳到第三句开始唱的地方");
+        assert_eq!(app.lyric_line, Some(3));
+        assert_eq!(app.lyric_scroll.value(), 3.0, "歌词要当场落位");
+        assert_eq!(app.lyric_browse.value(), 0.0, "跳转之后滚动偏移要清零");
+    }
+
+    /// 滚轮量：鼠标一格（Lines）和触摸板（Pixels）都要换算成内向的行数。
+    #[test]
+    fn wheel_delta_turns_into_rows() {
+        // 往上滚（y 为正）= 看前面的词 = 负的行数
+        let up = wheel_rows(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 });
+        let down = wheel_rows(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 });
+        assert_eq!(up, -LYRIC_WHEEL_ROWS);
+        assert_eq!(down, LYRIC_WHEEL_ROWS);
+
+        // 触摸板的像素量：连续滚动，方向一致、量级和「行」对得上
+        let px = wheel_rows(mouse::ScrollDelta::Pixels { x: 0.0, y: -40.0 });
+        assert!((px - LYRIC_WHEEL_ROWS).abs() < 0.01);
+    }
+
     /// 亮度和字号按「离正中间几行」连续算：正中 1.0 / 一行开外 0.60，
     /// 一路单调变淡，到 `LYRIC_FADE_ROWS` 行外正好看不见。
     ///
@@ -4408,9 +4735,9 @@ mod tests {
         assert!(lyric_alpha(0.0, false) <= LYRIC_ALPHA_NEAR + 1e-6);
 
         // 字号：正中最大，一行开外回到常态，中间单调
-        assert_eq!(lyric_size(0.0), LYRIC_SIZE_ACTIVE);
-        assert_eq!(lyric_size(1.0), LYRIC_SIZE_IDLE);
-        assert!(lyric_size(0.5) > lyric_size(0.75));
+        assert_eq!(lyric_size(0.0, LYRIC_SIZE_IDLE), LYRIC_SIZE_ACTIVE);
+        assert_eq!(lyric_size(1.0, LYRIC_SIZE_IDLE), LYRIC_SIZE_IDLE);
+        assert!(lyric_size(0.5, LYRIC_SIZE_IDLE) > lyric_size(0.75, LYRIC_SIZE_IDLE));
     }
 
     /// 换片空档里按空格：手上那帧只是占位的，不该被当成「正在播」去翻暂停，

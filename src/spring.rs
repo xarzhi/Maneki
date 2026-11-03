@@ -65,9 +65,24 @@ impl Spring {
         Self::new(position, LYRIC_STIFFNESS, LYRIC_DAMPING)
     }
 
+    /// 一条「平滑跟过去、但不冲过头」的弹簧：`ζ = 32 / (2·√260) ≈ 0.99`，临界阻尼。
+    ///
+    /// 鼠标滚轮滚歌词用它。滚轮本身是一格一格来的，直接改位置会"跳"；
+    /// 可要是用 [`bouncy`](Self::bouncy)，滚一下会冲过位置再弹回来 —— 那就不是
+    /// 滚动了，是甩。临界阻尼正好：滑过去、贴住、停。
+    pub fn smooth(position: f32) -> Self {
+        Self::new(position, 260.0, 32.0)
+    }
+
     /// 现在在哪。
     pub fn value(&self) -> f32 {
         self.position
+    }
+
+    /// 目标在哪。滚轮要在这个值上累加（而不是在「现在在哪」上累加，
+    /// 否则连续快滚时会把还没走完的那一截吃掉）。
+    pub fn target(&self) -> f32 {
+        self.target
     }
 
     /// 换目标，**速度保留**。
