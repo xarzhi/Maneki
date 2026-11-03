@@ -58,6 +58,16 @@ const SEEK_STEP: f64 = 5.0;
 const VOL_STEP: f64 = 5.0;
 /// 音频舞台左边那块封面的边长上限（窗口窄的时候按比例缩）
 const ART_SIZE: f32 = 220.0;
+/// 封面的圆角半径。
+///
+/// 光晕那一层也要用同一个值：iced 的阴影是用 `rounded_box_sdf(.., border_radius)`
+/// 画的，圆角取自 `border.radius`。光晕那层只给了 `shadow` 没给 `border`
+/// （半径 0），于是方形光晕的四个**直角**就露在封面圆角外面 —— 看起来像
+/// 「封面四个角没截掉」。改这里要注意三处同时跟着变：
+/// - 有封面时 `image(..).border_radius`
+/// - 没封面时那个 `container` 的 `border.radius`
+/// - 外面光晕那层的 `border.radius`
+const ART_RADIUS: f32 = 16.0;
 /// 歌词窗：离当前行超过这么多行就彻底淡掉（再远的本来也在视口外）
 const LYRIC_FADE_ROWS: usize = 6;
 /// 歌词窗里一行占多高。定死高度，换行时整块才不会一抖一抖
@@ -2644,7 +2654,7 @@ impl App {
                 .width(Length::Fixed(side))
                 .height(Length::Fixed(side))
                 .content_fit(iced::ContentFit::Cover)
-                .border_radius(16.0)
+                .border_radius(ART_RADIUS)
                 .into(),
             None => container(
                 iced::widget::image(iced::widget::image::Handle::from_rgba(
@@ -2664,7 +2674,7 @@ impl App {
                 border: Border {
                     color: Color::from_rgba(1.0, 1.0, 1.0, 0.07),
                     width: 1.0,
-                    radius: 16.0.into(),
+                    radius: ART_RADIUS.into(),
                 },
                 ..container::Style::default()
             })
@@ -2672,10 +2682,18 @@ impl App {
         };
 
         // 光晕套在外面一层：有没有真封面都要呼吸
+        //
+        // `border.radius` 必须跟封面一样 —— 阴影的圆角就是从这个字段拿的
+        // （`rounded_box_sdf`），留默认 0 的话方形的光晕会在封面四个圆角外面
+        // 露出四个直角的亮边，看着就跟"角没截掉"一样。
         let art = container(art)
             .width(Length::Fixed(side))
             .height(Length::Fixed(side))
             .style(move |_| container::Style {
+                border: Border {
+                    radius: ART_RADIUS.into(),
+                    ..Border::default()
+                },
                 // 用「模糊的白影」当光晕：iced 没有径向渐变，这层柔光是代价最小
                 // 又最接近的做法，呼吸起来也不突兀。
                 shadow: Shadow {
