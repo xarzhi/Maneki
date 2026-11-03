@@ -14,6 +14,7 @@ mod probe;
 mod settings;
 mod single;
 mod spinner;
+mod spring;
 mod subtitle;
 mod ui;
 mod video;
@@ -61,9 +62,21 @@ const ART_SIZE: f32 = 220.0;
 const LYRIC_FADE_ROWS: usize = 6;
 /// 歌词窗里一行占多高。定死高度，换行时整块才不会一抖一抖
 const LYRIC_ROW_H: f32 = 26.0;
-/// 歌词换行时的上移过渡有多慢。比抽屉（`ANIM_TAU`）慢不少 ——
-/// 快了就像直接跳过去，慢一点才有「滑上来」的感觉
-const LYRIC_TAU: f32 = 0.19;
+/// 歌词当前行的字号，以及离它一行之外的字号。
+/// 中间是**连续插值**的：某一行离正中间越近字越大，换句时一行行变大的过程
+/// 跟着整列的弹簧一起走（AMLL 里那行放大也是按距离算的，不是「到点啪一下变大」）。
+const LYRIC_SIZE_ACTIVE: f32 = 17.0;
+const LYRIC_SIZE_IDLE: f32 = 13.5;
+/// 目标一下跳得比这还远（拖进度条、刚换歌）就别弹了，直接落位。
+///
+/// 一句一句往上唱着走，弹簧那点过冲是味道；可要是从第 2 句直接跳到第 40 句，
+/// 让弹簧去追就是「整列歌词糊成一片往上飞」，看着像卡了。六行已经是半个视口，
+/// 中间那段本来也看不清 —— 直接落位反而干净。
+const LYRIC_JUMP_ROWS: f32 = 6.0;
+/// 歌词的「当前行 / 相邻行」两档亮度，中间的由 `lyric_alpha` 连续插值。
+/// 当前行 1.0（纯白），相邻行 0.60，再往外按几何级数衰减到 0。
+const LYRIC_ALPHA_ACTIVE: f32 = 1.0;
+const LYRIC_ALPHA_NEAR: f32 = 0.60;
 /// 光晕呼吸一圈要几秒
 const AUDIO_PULSE: f32 = 4.2;
 /// 音频舞台的底色：比纯黑亮一档的冷灰，中间那块「唱片」才浮得起来
@@ -370,11 +383,14 @@ struct App {
     cover: Option<iced::widget::image::Handle>,
     /// 同步歌词当前唱到第几行（没歌词 / 纯文本歌词时是 `None`）
     lyric_line: Option<usize>,
-    /// 歌词**画在第几行的高度**，可以是小数。
+    /// 歌词**画在第几行的高度**，可以是小数，由一条弹簧推着走。
     ///
-    /// 换句时它慢慢追上 `lyric_line`（见 `animate` 里的 `LYRIC_TAU`），
-    /// 界面按它算整块歌词往上挪多少 —— 一步滑上去，不是直接跳。
-    lyric_scroll: f32,
+    /// 换句时它不是"逼近"到新行，而是**冲过头再弹回来**（见 `spring` 模块）——
+    /// AMLL 那种手感。界面按它算整块歌词往上挪多少，每行离它多远决定字号和亮度。
+    ///
+    /// 用弹簧而不是指数逼近还有一个好处：连唱两句间隔很短时，弹簧带着速度
+    /// 直接接上，整列是"一路滑过去"，不会每句都停一下再起步。
+    lyric_scroll: spring::Spring,
     /// 后台读标签的线程（第一次播音频时才创建，不拖慢启动）
     tag_loader: Option<meta::Loader>,
     paused: bool,
@@ -395,6 +411,9 @@ struct App {
     /// 1.0 = 完全露出，0.0 = 完全收起。用指数平滑逼近目标值做过渡动画
     bars: f32,
     last_active: Instant,
+    /// 上一帧动画是什么时候推的。动画按**真实经过的时间**推进，帧率抖、定时器
+    /// 早到/晚到都不影响走完的时间（见 `animate_with`）。
+    anim_last: Option<Instant>,
     cursor: Option<Point>,
     win_size: Size,
     muted_before: f64,
@@ -511,7 +530,7 @@ impl App {
             tags: meta::Meta::default(),
             cover: None,
             lyric_line: None,
-            lyric_scroll: 0.0,
+            lyric_scroll: spring::Spring::bouncy(0.0),
             tag_loader: None,
             paused: true,
             pause_sent: None,
@@ -523,6 +542,7 @@ impl App {
             seek_at: None,
             bars: 1.0,
             last_active: Instant::now(),
+            anim_last: None,
             cursor: None,
             win_size: Size::new(1180.0, 720.0),
             muted_before: 80.0,
@@ -653,7 +673,7 @@ impl App {
         self.tags = meta::Meta::default();
         self.cover = None;
         self.lyric_line = None;
-        self.lyric_scroll = 0.0;
+        self.lyric_scroll.snap(0.0);
         if audio::is_audio(&path) {
             if self.tag_loader.is_none() {
                 self.tag_loader = meta::Loader::spawn();
@@ -699,7 +719,7 @@ impl App {
         self.tags = meta::Meta::default();
         self.cover = None;
         self.lyric_line = None;
-        self.lyric_scroll = 0.0;
+        self.lyric_scroll.snap(0.0);
         // 代次也往前推一格：在途的旧快照（还是上一条片子的画面/进度）一律不认，
         // 否则刚清空的界面会被它们重新填回旧数字。
         self.load_gen = self.load_gen.wrapping_add(1);
@@ -930,9 +950,20 @@ impl App {
             || self.info_anim > 0.002
     }
 
+    /// 按**名义上的** 16ms 推一帧。只有单测走这条路 —— 它们不关心真实时间，
+    /// 要的是「第 N 帧状态可复现」。运行时走 `animate_with`，用真实帧间隔。
+    #[cfg(test)]
     fn animate(&mut self) {
-        // 16ms 一帧，用 1-exp(-dt/tau) 做与帧率无关的指数逼近
-        let dt = 1.0 / 60.0;
+        self.animate_with(1.0 / 60.0);
+    }
+
+    /// 推进一帧动画。`dt` 是**这一帧真实过了多久**（秒）。
+    ///
+    /// 指数逼近（`1-exp(-dt/tau)`）和弹簧积分都按真实 `dt` 走，所以掉帧、或者定时器
+    /// 早到/晚到，走完的时间都一样 —— 画出来的轨迹不会因为帧率抖而抖。
+    fn animate_with(&mut self, dt: f32) {
+        // 夹一下：窗口被挂起、隔几秒才回来时，一帧别把动画推到天上去
+        let dt = dt.clamp(0.001, 0.05);
         let k = 1.0 - (-dt / ANIM_TAU).exp();
 
         let bars = if self.want_bars() { 1.0 } else { 0.0 };
@@ -961,11 +992,19 @@ impl App {
             self.pulse = (self.pulse + dt / AUDIO_PULSE) % 1.0;
         }
 
-        // 歌词换行走自己的时间常数：比抽屉慢，才有「往上滑一句」的感觉。
-        // 目标就是当前该唱的那一行；一句都没有时回到顶上。
-        let kl = 1.0 - (-dt / LYRIC_TAU).exp();
-        let line = self.lyric_line.unwrap_or(0) as f32;
-        self.lyric_scroll = approach(self.lyric_scroll, line, kl);
+        // 歌词：目标就是当前该唱的那一行（一句都没有时回顶上），由弹簧推过去。
+        //
+        // 这里**只换目标、不重置速度**（`set_target` 而不是 `snap`）：一句还没落定
+        // 下一句就来了（快歌、或者用户连按几下方向键），整列带着动量接着滑，
+        // 看着是"一路滚过去"；每句都清零的话会一顿一顿。
+        let target = self.lyric_line.unwrap_or(0) as f32;
+        if (target - self.lyric_scroll.value()).abs() > LYRIC_JUMP_ROWS {
+            // 跳得太远（拖进度条 / 刚换歌）：直接落位，别让它飞
+            self.lyric_scroll.snap(target);
+        } else {
+            self.lyric_scroll.set_target(target);
+        }
+        self.lyric_scroll.tick(dt);
     }
 
     /// 换片转圈现在的不透明度（0 = 不画，1 = 完全显示）。
@@ -1060,7 +1099,8 @@ impl App {
             // 新歌词就从当前播放位置重新对一次行，不然要等下一次 tick 才亮。
             // 位置也直接定位过去：不然第一句会从顶上滑下来，像放错了歌。
             self.lyric_line = self.tags.lyrics.as_ref().and_then(|l| l.index_at(self.position));
-            self.lyric_scroll = self.lyric_line.unwrap_or(0) as f32;
+            self.lyric_scroll
+                .snap(self.lyric_line.unwrap_or(0) as f32);
         }
     }
 
@@ -1278,7 +1318,13 @@ impl App {
             }
         }
 
-        self.animate();
+        // 动画按真实帧间隔推进：定时器偶尔早到/晚到、或者掉一帧，动画速度都不变
+        let dt = self
+            .anim_last
+            .map(|last| last.elapsed().as_secs_f32())
+            .unwrap_or(1.0 / 60.0);
+        self.anim_last = Some(Instant::now());
+        self.animate_with(dt);
     }
 
     fn send(&self, cmd: Cmd) {
@@ -2491,7 +2537,7 @@ impl App {
         let right = container(lyrics_view(
             self.tags.lyrics.as_ref(),
             self.lyric_line,
-            self.lyric_scroll,
+            self.lyric_scroll.value(),
             text_w,
             panel_h,
         ))
@@ -3047,7 +3093,6 @@ fn lyrics_view<'a>(
         meta::Lyrics::Synced(lines) => {
             // 前奏（一句都还没到）时也把第 0 行摆在正中间，只是不点亮：
             // 第一句真的唱出来时只有颜色变化，整块歌词不会先跳一格子。
-            let active = current.unwrap_or(0).min(lines.len() - 1);
             let lit = current.is_some();
 
             let (first, pad) = lyric_layout(scroll, height);
@@ -3058,27 +3103,21 @@ fn lyrics_view<'a>(
             rows.push(space().height(Length::Fixed(pad)).into());
 
             for i in first..lines.len().min(first + count) {
-                let d = i.abs_diff(active);
-                // 越远越淡：当前行亮白，上下第一行半亮，六行开外就看不见了
-                let alpha = if d == 0 && lit {
-                    1.0
-                } else {
-                    match d {
-                        0 | 1 => 0.60,
-                        2 => 0.44,
-                        3 => 0.30,
-                        4 => 0.18,
-                        5 => 0.10,
-                        _ if d <= LYRIC_FADE_ROWS => 0.05,
-                        _ => 0.0,
-                    }
-                };
-                let size = if d == 0 { 17.0 } else { 13.5 };
+                // 离正中间有多远（**连续值**：`scroll` 是弹簧推着的小数）。
+                // 字号和亮度都按它算，所以换句那一小段时间里，行是一路变大变亮、
+                // 而不是"到点啪一下"跳档 —— AMLL 也是按距离插值的。
+                let d = (i as f32 - scroll).abs();
+                let alpha = lyric_alpha(d, lit);
+                let size = lyric_size(d);
 
                 rows.push(
                     container(
                         text(ui::elide(&lines[i].text, budget, size))
-                            .font(if d == 0 { icon::UI_BOLD } else { icon::UI_FONT })
+                            .font(if d < 0.5 {
+                                icon::UI_BOLD
+                            } else {
+                                icon::UI_FONT
+                            })
                             .size(size)
                             .color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
                             .width(Fill)
@@ -3099,6 +3138,43 @@ fn lyrics_view<'a>(
                 .into()
         }
     }
+}
+
+/// 离正中间 `d` 行的那一行该多亮。
+///
+/// `d` 是**连续值**（`scroll` 由弹簧推着，可以是 3.42 这种）。规则是：
+///
+/// - 正中间那行纯白（`LYRIC_ALPHA_ACTIVE`）；
+/// - 相邻行 `LYRIC_ALPHA_NEAR`（0.60），往外每多一行乘 0.68 —— 到第 6 行正好
+///   淡到 0.05 左右，肉眼看不见了；
+/// - 最后一行（`LYRIC_FADE_ROWS` 附近）再乘一个线性收尾，避免视口边缘突然
+///   冒出一行灰字。
+///
+/// `lit = false`（前奏，一句都还没唱到）时整列都压到"相邻行"的亮度：
+/// 这时候没有"当前句"，不该有一行是白的。
+fn lyric_alpha(d: f32, lit: bool) -> f32 {
+    let d = d.max(0.0);
+    let base = if d <= 1.0 {
+        LYRIC_ALPHA_ACTIVE + (LYRIC_ALPHA_NEAR - LYRIC_ALPHA_ACTIVE) * d
+    } else {
+        LYRIC_ALPHA_NEAR * 0.68f32.powf(d - 1.0)
+    };
+    let tail = (LYRIC_FADE_ROWS as f32 - d).clamp(0.0, 1.0);
+    let alpha = base * tail;
+    if lit {
+        alpha
+    } else {
+        alpha.min(LYRIC_ALPHA_NEAR)
+    }
+}
+
+/// 离正中间 `d` 行的那一行用多大字号。
+///
+/// 正中间 `LYRIC_SIZE_ACTIVE`，一行开外就回到 `LYRIC_SIZE_IDLE`，中间线性插值。
+/// 换句时旧行缩回、新行长大是跟着弹簧一起走的，不是分档跳。
+fn lyric_size(d: f32) -> f32 {
+    let t = d.clamp(0.0, 1.0);
+    LYRIC_SIZE_IDLE + (LYRIC_SIZE_ACTIVE - LYRIC_SIZE_IDLE) * (1.0 - t)
 }
 
 /// 同步歌词要「从第几行开始画」和「顶部留白多高」。
@@ -4241,6 +4317,100 @@ mod tests {
         let _ = app.update(Message::StagePress);
         let _ = app.update(Message::StageRelease);
         assert!(app.paused, "视频画面点一下还是暂停");
+    }
+
+    /// 换句必须走「弹簧」：先冲过目标一点，再弹回来落定。
+    ///
+    /// 这条盯的是 `animate_with` 里那一步。原来的写法是指数逼近
+    /// （`approach`），它**永远不会越过目标**——数值超不过 1.0，「弹」就没了，
+    /// 只剩「滑」。所以这里直接断言峰值 > 1.05。
+    #[test]
+    fn lyric_scroll_overshoots_the_next_line_and_settles() {
+        let mut app = app();
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..4)
+                .map(|i| meta::Line {
+                    at: i as f64 * 4.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(0);
+        app.lyric_scroll.snap(0.0);
+
+        // 唱到第二句
+        app.lyric_line = Some(1);
+        let mut peak = 0.0f32;
+        let mut frames = 0;
+        while frames < 180 {
+            app.animate();
+            peak = peak.max(app.lyric_scroll.value());
+            frames += 1;
+        }
+
+        assert!(
+            peak > 1.05,
+            "滑过目标才叫弹簧，峰值只有 {peak}（是不是又退回成缓动了）"
+        );
+        assert!(peak < 1.4, "冲得太狠了，整列会像被甩出去：{peak}");
+        assert!(
+            (app.lyric_scroll.value() - 1.0).abs() < 0.01,
+            "三秒之后还没落回第二句：{}",
+            app.lyric_scroll.value()
+        );
+    }
+
+    /// 拖进度条 / 刚换歌那种「一下跳到很远」的情况不该走弹簧：
+    /// 整列飞过去看着像卡了，直接落位才对。
+    #[test]
+    fn a_far_seek_drops_the_lyrics_instead_of_flying() {
+        let mut app = app();
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..40)
+                .map(|i| meta::Line {
+                    at: i as f64,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(0);
+        app.lyric_scroll.snap(0.0);
+
+        app.lyric_line = Some(30);
+        app.animate();
+        assert_eq!(
+            app.lyric_scroll.value(),
+            30.0,
+            "跳这么远应该直接落位，不该一帧一帧飞过去"
+        );
+    }
+
+    /// 亮度和字号按「离正中间几行」连续算：正中 1.0 / 一行开外 0.60，
+    /// 一路单调变淡，到 `LYRIC_FADE_ROWS` 行外正好看不见。
+    ///
+    /// 连续是关键 —— 分档跳的话，弹簧滑到一半时那一行会突然变亮变白。
+    #[test]
+    fn lyric_alpha_and_size_fall_off_smoothly() {
+        assert_eq!(lyric_alpha(0.0, true), LYRIC_ALPHA_ACTIVE);
+        assert!((lyric_alpha(1.0, true) - LYRIC_ALPHA_NEAR).abs() < 1e-5);
+        assert_eq!(lyric_alpha(LYRIC_FADE_ROWS as f32, true), 0.0);
+
+        let mut prev = lyric_alpha(0.0, true);
+        let mut d = 0.0;
+        while d < LYRIC_FADE_ROWS as f32 {
+            d += 0.125;
+            let now = lyric_alpha(d, true);
+            assert!(now <= prev + 1e-6, "亮度要一路变淡，{d} 行反而更亮了");
+            prev = now;
+        }
+
+        // 前奏（还没唱到第一句）不该有一行是纯白的
+        assert!(lyric_alpha(0.0, false) <= LYRIC_ALPHA_NEAR + 1e-6);
+
+        // 字号：正中最大，一行开外回到常态，中间单调
+        assert_eq!(lyric_size(0.0), LYRIC_SIZE_ACTIVE);
+        assert_eq!(lyric_size(1.0), LYRIC_SIZE_IDLE);
+        assert!(lyric_size(0.5) > lyric_size(0.75));
     }
 
     /// 换片空档里按空格：手上那帧只是占位的，不该被当成「正在播」去翻暂停，
