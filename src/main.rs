@@ -129,6 +129,14 @@ const BAR_ALPHA: f32 = 0.34;
 /// 窗口最小尺寸（逻辑像素）
 const MIN_W: f32 = 560.0;
 const MIN_H: f32 = 400.0;
+/// 打开时用的窗口尺寸（逻辑像素）。
+///
+/// 定死，**不跟着视频比例变**：以前每打开一批文件就按第一帧的宽高把窗口重摆一次，
+/// 于是 21:9 的片子把窗口拉成一条，下一集换成 4:3 又收回去 —— 用户自己拉好的
+/// 形状被动来动去。现在窗口只由用户决定。屏幕比这个尺寸还小的时候，
+/// `fit_window_on_start` 会等比缩一下（只做一次）。
+const WIN_W: f32 = 1180.0;
+const WIN_H: f32 = 720.0;
 
 /// 底栏图标按钮的边长（和 `icon_button` 一致，音量 popover 靠它对位）
 const ICON_BTN: f32 = 34.0;
@@ -238,7 +246,10 @@ fn main() -> iced::Result {
         .theme(|_: &App| Theme::Dark)
         .subscription(App::subscription)
         .window(iced::window::Settings {
-            size: Size::new(1180.0, 720.0),
+            size: Size::new(WIN_W, WIN_H),
+            // 屏幕正中打开。`Position::Centered` 是 winit 自己算的，比在
+            // `GotHwnd` 里手摆一次更稳（那一下会先闪一下系统默认位置）。
+            position: iced::window::Position::Centered,
             decorations: false,
             // 任务栏 / Alt-Tab 的图标
             icon: iced::window::icon::from_rgba(
@@ -379,10 +390,6 @@ struct App {
     drag: Option<DragResize>,
     /// 正在按住顶栏挪窗口时的起始快照
     moving: Option<DragMove>,
-    /// 当前视频的显示尺寸（dwidth/dheight）
-    video_size: Option<(u32, u32)>,
-    /// 这个文件是不是已经按视频尺寸调过窗口了（只调一次，别跟用户手动改尺寸打架）
-    sized_for_video: bool,
 
     error: Option<String>,
     title: String,
@@ -564,8 +571,6 @@ impl App {
             hwnd: None,
             drag: None,
             moving: None,
-            video_size: None,
-            sized_for_video: false,
             error,
             title: String::from("Maneki"),
             current: None,
@@ -711,11 +716,6 @@ impl App {
         self.error = None;
         self.bars = 1.0;
         self.last_active = Instant::now();
-        self.video_size = None;
-        // 注意：这里**不动** `sized_for_video`。换集（点下一集、连播、点列表某一行）
-        // 都不该重新摆窗口 —— 用户把窗口拉成什么形状是他自己的事，换个片子就被
-        // 拽回去很讨厌。只有「重新打开一批文件」（拖进来 / 文件对话框 / 命令行）
-        // 才在 `open_paths` 里把它复位，让窗口按新视频的尺寸重新摆一次。
         self.tracks.clear();
         self.embedded_subs = false;
         self.sid = None;
@@ -761,7 +761,6 @@ impl App {
         // 免得下一次 play 的头几帧被它挡着不认快照
         self.pause_sent = None;
         self.seek_at = None;
-        self.video_size = None;
         self.open_ms = None;
         self.fps = 0.0;
         self.tracks.clear();
@@ -842,10 +841,6 @@ impl App {
 
         let single_file = paths.len() == 1 && paths[0].is_file();
 
-        // 新打开一批文件 = 新的一次「打开」，窗口可以按视频尺寸重新摆一次。
-        // 换集（上一集 / 下一集 / 连播 / 点列表某一行）不走这里，所以不会动窗口。
-        self.sized_for_video = false;
-
         if single_file {
             self.playlist.set(None, scan.files);
             self.play_index(0);
@@ -903,11 +898,17 @@ impl App {
         }
     }
 
-    /// 把窗口调成和视频一样的比例，这样画面铺满、不留黑边。
+    /// 把窗口摆到**工作区**正中（只在启动时做一次）。
     ///
-    /// 全用物理像素算：视频 1 像素 = 屏幕 1 像素最清晰，
-    /// 也省掉了 DPI 换算（SetWindowPos 本来就是物理像素）。
-    fn fit_window_to_video(&mut self, vw: u32, vh: u32) {
+    /// iced 的 `Position::Centered` 按整个显示器算，任务栏那 40px 一扣，
+    /// 窗口看起来就偏下十几像素；尺寸也是定死的 `WIN_W x WIN_H`，小屏笔记本上
+    /// 会顶出屏幕（底栏就永远点不到了）。所以拿到 hwnd 之后统一按工作区再摆一次：
+    /// 放不下就等比缩到 96% 以内，然后居中。
+    ///
+    /// **只做一次。** 之后窗口多大、在哪，全听用户的 —— 播放任何东西都不会再动它。
+    ///
+    /// 全用物理像素算：`SetWindowPos` 收的就是物理像素，也省掉 DPI 换算。
+    fn settle_window_on_start(&mut self) {
         if self.fullscreen {
             return;
         }
@@ -915,45 +916,27 @@ impl App {
         if win32::is_maximized(hwnd) {
             return;
         }
-        if vw < 2 || vh < 2 {
-            return;
-        }
-
-        let scale = win32::dpi_scale(hwnd) as f64;
-        let min_w = (MIN_W as f64 * scale).round();
-        let min_h = (MIN_H as f64 * scale).round();
-
-        let mut w = vw as f64;
-        let mut h = vh as f64;
-
-        // 太小的视频别开成指甲盖（同时保证顶底栏不会被挤爆）
-        if w < min_w || h < min_h {
-            let k = (min_w / w).max(min_h / h);
-            w *= k;
-            h *= k;
-        }
-
         let Some((ax, ay, aw, ah)) = win32::work_area(hwnd) else {
             return;
         };
 
-        // 再大的也收进工作区（留 4% 边距，别顶到任务栏和屏幕边）
+        let scale = win32::dpi_scale(hwnd) as f64;
+        let want_w = (WIN_W as f64 * scale).round();
+        let want_h = (WIN_H as f64 * scale).round();
+
+        // 留 4% 边距，别顶着任务栏和屏幕边
         let max_w = aw as f64 * 0.96;
         let max_h = ah as f64 * 0.96;
-        if w > max_w || h > max_h {
-            let k = (max_w / w).min(max_h / h);
-            w *= k;
-            h *= k;
-        }
+        let (w, h) = if want_w > max_w || want_h > max_h {
+            let k = (max_w / want_w).min(max_h / want_h);
+            ((want_w * k).round(), (want_h * k).round())
+        } else {
+            (want_w, want_h)
+        };
 
-        let (w, h) = (w.round() as i32, h.round() as i32);
-
-        // 窗口中心保持不动，只改大小和比例
-        let (cx, cy, cw, ch) = win32::window_rect(hwnd).unwrap_or((ax, ay, w, h));
-        let center = (cx + cw / 2, cy + ch / 2);
-        let x = (center.0 - w / 2).clamp(ax, (ax + aw - w).max(ax));
-        let y = (center.1 - h / 2).clamp(ay, (ay + ah - h).max(ay));
-
+        let (w, h) = (w.max(1.0) as i32, h.max(1.0) as i32);
+        let x = ax + (aw - w) / 2;
+        let y = ay + (ah - h) / 2;
         win32::set_window_rect(hwnd, x, y, w, h);
     }
 
@@ -1360,7 +1343,6 @@ impl App {
             self.open_paths(paths);
         }
 
-        let mut new_video_size = None;
         // 播完了要不要接下一集（在下面统一处理，避免和 `player` 的可变借用打架）
         let mut advance_to = None;
 
@@ -1436,8 +1418,6 @@ impl App {
                     self.error = Some(e);
                 }
 
-                new_video_size = snap.video_size;
-
                 // 轨道表只增不减地跟着走：弹窗开着时字幕列表要实时反映
                 self.tracks = snap.tracks;
                 self.embedded_subs = snap.embedded_subs;
@@ -1468,15 +1448,6 @@ impl App {
         // 歌词跟着播放位置走（视频没有歌词，直接跳过）
         if self.is_audio() {
             self.step_lyrics();
-        }
-
-        // 拿到视频真实尺寸后按它的比例摆一次窗口（每个文件只摆一次）
-        if let Some(size) = new_video_size {
-            self.video_size = Some(size);
-            if !self.sized_for_video {
-                self.sized_for_video = true;
-                self.fit_window_to_video(size.0, size.1);
-            }
         }
 
         // 动画按真实帧间隔推进：定时器偶尔早到/晚到、或者掉一帧，动画速度都不变
@@ -1886,6 +1857,8 @@ impl App {
                     win32::polish(h);
                     // 以窗口真实状态为准（比如被别的程序置顶过）
                     self.topmost = win32::is_topmost(h);
+                    // 摆到工作区正中；小屏放不下时缩一下
+                    self.settle_window_on_start();
                 }
             }
 

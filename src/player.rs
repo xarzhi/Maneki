@@ -74,9 +74,6 @@ pub struct Snapshot {
     pub open_ms: Option<f64>,
     /// 实际出帧速率，用来验证「是不是真的在流畅播放」
     pub fps: f32,
-    /// 视频的显示尺寸（mpv 的 dwidth/dheight，已考虑像素长宽比和旋转）。
-    /// UI 拿它把窗口调成同样的比例，这样画面铺满、不出黑边。
-    pub video_size: Option<(u32, u32)>,
     /// 全部轨道（音视频也带着，UI 只挑 kind == "sub" 的用）
     pub tracks: Vec<Track>,
     /// 这个文件有没有内嵌字幕（外挂的不算）
@@ -186,7 +183,6 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
                     snap.frame = None;
                     snap.position = 0.0;
                     snap.duration = 0.0;
-                    snap.video_size = None;
                     snap.tracks.clear();
                     snap.embedded_subs = false;
                     snap.sid = None;
@@ -368,7 +364,6 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
             // mpv 的 `time-pos` / `eof-reached` 在 stop 之后还留着上一条的尾巴，
             // 照抄回去要么进度条跳一下，要么直接触发「放完了」去播下一集。
             snap.frame = None;
-            snap.video_size = None;
             snap.position = 0.0;
             snap.duration = 0.0;
             snap.eof = false;
@@ -392,16 +387,11 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
                 snap.eof = e.is_empty();
             }
             snap.frame = None;
-            snap.video_size = None;
             snap.open_ms = open_ms;
         } else {
             // ---------- 3. 有新帧就渲染 ----------
             let dw = mpv.get_i64("dwidth").unwrap_or(0).max(0) as u32;
             let dh = mpv.get_i64("dheight").unwrap_or(0).max(0) as u32;
-
-            if dw > 1 && dh > 1 {
-                snap.video_size = Some((dw, dh));
-            }
 
             if dw > 1 && dh > 1 && mpv.needs_render() {
                 let size = video::fit(Size::new(dw, dh), MAX);
