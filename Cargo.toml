@@ -13,6 +13,12 @@ rfd = "0.17.2"
 # 默认特性是 flac/vorbis/wav/mp3；aac + isomp4 是补上 m4a/aac。
 rodio = { version = "0.19", features = ["symphonia-aac", "symphonia-isomp4"] }
 
+# 音频的封面 / 歌词 / 曲名歌手：读标签只认 lofty（ID3、Vorbis、MP4、APE 一把抓）。
+# iced 开的是 `image-without-codecs`（它自己不解码），所以封面得我们自己解：
+# 只要 jpeg + png 两个解码器，其余格式关掉，省得白拉一堆依赖进来。
+lofty = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 # 给 exe 塞图标 + 版本信息（build.rs 里用）
 [build-dependencies]
 embed-resource = "3.0"

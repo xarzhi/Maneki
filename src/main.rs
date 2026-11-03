@@ -6,6 +6,7 @@ mod assoc;
 mod audio;
 mod icon;
 mod info;
+mod meta;
 mod mpv;
 mod player;
 mod playlist;
@@ -54,8 +55,12 @@ const DROP_SETTLE: Duration = Duration::from_millis(120);
 const SEEK_STEP: f64 = 5.0;
 /// ↑ / ↓ 一次调多少音量（音量刻度是 0~100）
 const VOL_STEP: f64 = 5.0;
-/// 音频舞台中间那块「唱片」的边长
-const ART_SIZE: f32 = 176.0;
+/// 音频舞台左边那块封面的边长上限（窗口窄的时候按比例缩）
+const ART_SIZE: f32 = 220.0;
+/// 歌词窗：当前行上下各显示几行（算上当前行一共 7 行）
+const LYRIC_WINDOW: isize = 3;
+/// 歌词窗里一行占多高。定死高度，换行时整块才不会一抖一抖
+const LYRIC_ROW_H: f32 = 26.0;
 /// 光晕呼吸一圈要几秒
 const AUDIO_PULSE: f32 = 4.2;
 /// 音频舞台的底色：比纯黑亮一档的冷灰，中间那块「唱片」才浮得起来
@@ -355,6 +360,15 @@ struct App {
     spin: f32,
     /// 音频舞台那圈光晕的相位，0..1 一整圈（播放时慢慢呼吸）
     pulse: f32,
+    /// 音频的曲名 / 歌手 / 封面 / 歌词，后台线程读完丢进来
+    tags: meta::Meta,
+    /// 封面位图。`tags.cover` 里那份原始像素换成了 iced 的 `Handle` 存这儿 ——
+    /// 每帧 `image()` 都要拿一个 Handle，从 RGBA 现造等于每帧重传一遍像素。
+    cover: Option<iced::widget::image::Handle>,
+    /// 同步歌词当前唱到第几行（没歌词 / 纯文本歌词时是 `None`）
+    lyric_line: Option<usize>,
+    /// 后台读标签的线程（第一次播音频时才创建，不拖慢启动）
+    tag_loader: Option<meta::Loader>,
     paused: bool,
     /// 最近一次「播放 / 暂停」是什么时候发给 mpv 的。
     ///
@@ -486,6 +500,10 @@ impl App {
             loading_since: None,
             spin: 0.0,
             pulse: 0.0,
+            tags: meta::Meta::default(),
+            cover: None,
+            lyric_line: None,
+            tag_loader: None,
             paused: true,
             pause_sent: None,
             duration: 0.0,
@@ -621,6 +639,20 @@ impl App {
         self.sid = None;
         self.sub_hint = None;
 
+        // 封面 / 歌词先清空，别让上一首歌的封面在新歌上挂一会儿。
+        // 只有音频才去读：视频的标签用不上，白读一遍还多开一条线程。
+        self.tags = meta::Meta::default();
+        self.cover = None;
+        self.lyric_line = None;
+        if audio::is_audio(&path) {
+            if self.tag_loader.is_none() {
+                self.tag_loader = meta::Loader::spawn();
+            }
+            if let Some(loader) = &self.tag_loader {
+                loader.request(path.clone());
+            }
+        }
+
         self.load_gen = self.load_gen.wrapping_add(1);
         player.send(Cmd::Load(path, self.load_gen));
     }
@@ -653,6 +685,10 @@ impl App {
         self.info = None;
         self.eof_prev = false;
         self.error = None;
+        // 封面 / 歌词跟着一起清：界面回到「从列表里挑一个」的空白页
+        self.tags = meta::Meta::default();
+        self.cover = None;
+        self.lyric_line = None;
         // 代次也往前推一格：在途的旧快照（还是上一条片子的画面/进度）一律不认，
         // 否则刚清空的界面会被它们重新填回旧数字。
         self.load_gen = self.load_gen.wrapping_add(1);
@@ -987,6 +1023,39 @@ impl App {
         }
     }
 
+    /// 收后台线程读到的标签（封面 / 歌词 / 曲名）。
+    fn drain_tags(&mut self) {
+        let got = match &self.tag_loader {
+            Some(l) => l.drain(),
+            None => return,
+        };
+        for (path, mut tags) in got {
+            // 只认当前这条：连点几首歌时，前一首的标签可能晚到，
+            // 直接收下会把新歌的封面盖成上一首的。
+            if self.current.as_deref() != Some(path.as_path()) {
+                continue;
+            }
+            self.cover = tags
+                .cover
+                .take()
+                .map(|c| iced::widget::image::Handle::from_rgba(c.width, c.height, c.rgba));
+            self.tags = tags;
+            // 新歌词就从当前播放位置重新对一次行，不然要等下一次 tick 才亮
+            self.lyric_line = self.tags.lyrics.as_ref().and_then(|l| l.index_at(self.position));
+        }
+    }
+
+    /// 按当前播放位置更新「唱到第几行」。
+    ///
+    /// 放音频时每帧调一次；纯文本歌词 / 没有歌词时这里一直是 `None`。
+    fn step_lyrics(&mut self) {
+        let Some(lyrics) = &self.tags.lyrics else {
+            self.lyric_line = None;
+            return;
+        };
+        self.lyric_line = lyrics.index_at(self.position);
+    }
+
     fn touch(&mut self) {
         self.last_active = Instant::now();
     }
@@ -1062,6 +1131,7 @@ impl App {
         self.step_move();
         self.flush_drops();
         self.drain_probe();
+        self.drain_tags();
 
 
         // 别的实例把路径转交过来了（又双击了一次 exe / 把视频「打开方式」选成本程序）：
@@ -1173,6 +1243,11 @@ impl App {
 
         if let Some(next) = advance_to {
             self.play_index(next);
+        }
+
+        // 歌词跟着播放位置走（视频没有歌词，直接跳过）
+        if self.is_audio() {
+            self.step_lyrics();
         }
 
         // 拿到视频真实尺寸后按它的比例摆一次窗口（每个文件只摆一次）
@@ -1684,8 +1759,12 @@ impl App {
             Message::StageRelease => {
                 let armed = self.stage_press;
                 self.stage_press = false;
-                // 松手时已经在栏上了（按住拖动到栏上再松手）也不算
-                if armed && !self.cursor_over_bars() {
+                // 松手时已经在栏上了（按住拖动到栏上再松手）也不算。
+                //
+                // 音频再挡一道：`view()` 那边音频分支压根没挂按下/松手，正常情况
+                // 这里收不到 —— 但挡住它比「以后谁手滑又给挂回去、点一下歌就停了」
+                // 便宜得多。歌不是画面，点它不该当播放开关。
+                if armed && !self.is_audio() && !self.cursor_over_bars() {
                     self.toggle_play();
                 }
             }
@@ -2022,11 +2101,12 @@ impl App {
                 .into()
         } else if self.is_audio() {
             // 纯音频：没有画面可画，给它一块自己的静物界面。
-            // 也要挂上「点一下暂停」—— 音频用户同样习惯点空白处切歌。
+            //
+            // **故意不挂 on_press / on_release**：这里不是画面，点空白处不该
+            // 把歌暂停掉 —— 想拖动歌词看一眼、点在封面上，都不该打断播放。
+            // 暂停有底栏那颗按钮（还有空格键），不用再拿整块舞台当开关。
             mouse_area(self.audio_stage())
                 .interaction(mouse::Interaction::Idle)
-                .on_press(Message::StagePress)
-                .on_release(Message::StageRelease)
                 .on_right_press(Message::ContextMenu)
                 .into()
         } else if self.current.is_some() || spin_preview() {
@@ -2281,10 +2361,10 @@ impl App {
         .into()
     }
 
-    /// 纯音频的舞台：中间一块「唱片」+ 文件名 + 状态。
+    /// 纯音频的舞台：左边封面，右边歌词。
     ///
     /// 音频没有画面，走不到上面那条 shader 分支；这里给一块安静的界面顶上。
-    /// 播放时方块外面那圈光会缓慢呼吸（相位在 `animate` 里推进），暂停就停住 ——
+    /// 播放时封面外面那圈光会缓慢呼吸（相位在 `animate` 里推进），暂停就停住 ——
     /// 「在放」和「停着」不用看按钮也能一眼分出来。
     fn audio_stage(&self) -> Element<'_, Message> {
         // 0..1 之间正弦来回走。暂停时固定在 0.5，留一点微光，别整个死掉
@@ -2295,38 +2375,64 @@ impl App {
         };
         let glow = 0.04 + 0.09 * breath;
 
-        let art = container(
-            iced::widget::image(iced::widget::image::Handle::from_rgba(
-                LOGO_BIG_SRC,
-                LOGO_BIG_SRC,
-                LOGO_BIG_RGBA,
-            ))
-            .width(Length::Fixed(96.0))
-            .height(Length::Fixed(96.0)),
-        )
-        .width(Length::Fixed(ART_SIZE))
-        .height(Length::Fixed(ART_SIZE))
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(Color::from_rgb(0.10, 0.11, 0.13))),
-            border: Border {
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.07),
-                width: 1.0,
-                radius: 26.0.into(),
-            },
-            // 用「模糊的白影」当光晕：iced 没有径向渐变，这层柔光是代价最小
-            // 又最接近的做法，呼吸起来也不突兀。
-            shadow: Shadow {
-                color: Color::from_rgba(1.0, 1.0, 1.0, glow),
-                offset: Vector::ZERO,
-                blur_radius: 46.0,
-            },
-            ..container::Style::default()
-        });
+        // 两栏都按窗口宽度伸缩：封面 19%、歌词 34%，各自有上下限。
+        // 560 宽（程序允许的最小宽度）下两栏也并得下，不会挤成一条缝。
+        let side = (self.win_size.width * 0.19).clamp(112.0, ART_SIZE);
+        let lyrics_w = (self.win_size.width * 0.34).clamp(200.0, 420.0);
+        // 歌词窗一行 26，七行加间距要 194 —— 窗口太矮时封面会缩到 112，
+        // 那点高度摆不下七行，所以歌词这一栏至少 196 高。
+        let panel_h = side.max(196.0);
 
-        // 音频文件名常常是「歌手 - 歌名 - 专辑」一长串，按窗口宽度截断
-        let budget = (self.win_size.width - 160.0).clamp(160.0, 620.0);
+        // 有内嵌封面就贴封面；没有还是原来那只猫
+        let art: Element<'_, Message> = match &self.cover {
+            Some(handle) => iced::widget::image(handle.clone())
+                .width(Length::Fixed(side))
+                .height(Length::Fixed(side))
+                .content_fit(iced::ContentFit::Cover)
+                .border_radius(16.0)
+                .into(),
+            None => container(
+                iced::widget::image(iced::widget::image::Handle::from_rgba(
+                    LOGO_BIG_SRC,
+                    LOGO_BIG_SRC,
+                    LOGO_BIG_RGBA,
+                ))
+                .width(Length::Fixed(side * 0.46))
+                .height(Length::Fixed(side * 0.46)),
+            )
+            .width(Length::Fixed(side))
+            .height(Length::Fixed(side))
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.10, 0.11, 0.13))),
+                border: Border {
+                    color: Color::from_rgba(1.0, 1.0, 1.0, 0.07),
+                    width: 1.0,
+                    radius: 16.0.into(),
+                },
+                ..container::Style::default()
+            })
+            .into(),
+        };
+
+        // 光晕套在外面一层：有没有真封面都要呼吸
+        let art = container(art)
+            .width(Length::Fixed(side))
+            .height(Length::Fixed(side))
+            .style(move |_| container::Style {
+                // 用「模糊的白影」当光晕：iced 没有径向渐变，这层柔光是代价最小
+                // 又最接近的做法，呼吸起来也不突兀。
+                shadow: Shadow {
+                    color: Color::from_rgba(1.0, 1.0, 1.0, glow),
+                    offset: Vector::ZERO,
+                    blur_radius: 46.0,
+                },
+                ..container::Style::default()
+            });
+
+        // 标签里有曲名就用它，没有退回文件名（`self.title` 一直是文件名）
+        let name = self.tags.title.as_deref().unwrap_or(&self.title);
         let ext = self
             .current
             .as_ref()
@@ -2334,28 +2440,44 @@ impl App {
             .map(|e| e.to_string_lossy().to_uppercase())
             .unwrap_or_else(|| String::from("AUDIO"));
         let state = if self.paused { "已暂停" } else { "正在播放" };
+        let sub = match &self.tags.artist {
+            Some(artist) => format!("{artist} · {ext} · {state}"),
+            None => format!("{ext} · {state}"),
+        };
 
-        container(
-            column![
-                art,
-                text(ui::elide(&self.title, budget, 21.0))
-                    .font(icon::UI_BOLD)
-                    .size(21.0)
-                    .color(icon::TEXT),
-                text(format!("{ext} · {state}"))
-                    .font(icon::UI_FONT)
-                    .size(13.0)
-                    .color(icon::TEXT_FAINT),
-            ]
-            .spacing(24)
-            .align_x(Alignment::Center),
-        )
-        .center(Fill)
-        .style(|_| container::Style {
-            background: Some(Background::Color(AUDIO_BG)),
-            ..container::Style::default()
-        })
-        .into()
+        let info = column![
+            text(ui::elide(name, side + 20.0, 17.0))
+                .font(icon::UI_BOLD)
+                .size(17.0)
+                .color(icon::TEXT),
+            text(ui::elide(&sub, side + 20.0, 12.5))
+                .font(icon::UI_FONT)
+                .size(12.5)
+                .color(icon::TEXT_FAINT),
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center);
+
+        let left = column![art, info]
+            .spacing(20)
+            .width(Length::Fixed(side + 40.0))
+            .align_x(Alignment::Center);
+
+        let right = container(lyrics_view(
+            self.tags.lyrics.as_ref(),
+            self.lyric_line,
+            lyrics_w,
+        ))
+        .width(Length::Fixed(lyrics_w))
+        .height(Length::Fixed(panel_h));
+
+        container(row![left, right].spacing(36).align_y(Alignment::Center))
+            .center(Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(AUDIO_BG)),
+                ..container::Style::default()
+            })
+            .into()
     }
 
     fn error_panel<'a>(&'a self, err: &'a str) -> Element<'a, Message> {
@@ -2833,6 +2955,123 @@ impl App {
             .align_y(Vertical::Top)
             .into()
     }
+}
+
+/// 歌词面板：三种情况各画各的。
+///
+/// - **同步歌词**：取当前行上下各三行，一共七行固定高度 —— 当前行永远在正中间，
+///   像 KTV。不用 `scrollable` 是因为 iced 里让列表自己滚到某一行得走窗口操作，
+///   每换一句就要发一次任务；七行窗口既不用算偏移，也不会因为滚动动画拖泥带水。
+/// - **纯文本歌词**：没有时间轴对不了行，就给一个能自己滚的列表。
+/// - **没有歌词**：说一句，别留一块空白让人以为界面挂了。
+fn lyrics_view<'a>(
+    lyrics: Option<&'a meta::Lyrics>,
+    current: Option<usize>,
+    width: f32,
+) -> Element<'a, Message> {
+    // 一行歌词最多这么宽：留 8px 给右边，免得贴着栏边
+    let budget = (width - 8.0).max(40.0);
+
+    let Some(lyrics) = lyrics else {
+        return lyrics_hint("没有歌词", Some("把同名 .lrc 放在音乐旁边，或写进标签里"));
+    };
+    if lyrics.len() == 0 {
+        return lyrics_hint("歌词是空的", None);
+    }
+
+    match lyrics {
+        meta::Lyrics::Plain(lines) => {
+            let body = column(
+                lines
+                    .iter()
+                    .map(|line| {
+                        text(ui::elide(line, budget, 13.5))
+                            .font(icon::UI_FONT)
+                            .size(13.5)
+                            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.62))
+                            .width(Fill)
+                            .into()
+                    })
+                    .collect::<Vec<Element<'a, Message>>>(),
+            )
+            .spacing(7)
+            .width(Fill);
+
+            iced::widget::scrollable(body)
+                .height(Fill)
+                .width(Fill)
+                .into()
+        }
+        meta::Lyrics::Synced(lines) => {
+            // 前奏（一句都还没到）时也把第 0 行摆在正中间，只是不点亮：
+            // 第一句真的唱出来时只有颜色变化，整块歌词不会往上跳一格。
+            let active = current.unwrap_or(0).min(lines.len() - 1);
+            let lit = current.is_some();
+
+            let mut rows: Vec<Element<'a, Message>> =
+                Vec::with_capacity((LYRIC_WINDOW * 2 + 1) as usize);
+            for step in -LYRIC_WINDOW..=LYRIC_WINDOW {
+                let index = active as isize + step;
+                let (label, size, alpha) = if index >= 0 && (index as usize) < lines.len() {
+                    let d = step.unsigned_abs();
+                    // 越远越淡：当前行亮白，上下第一行半亮，再往外基本只剩个轮廓
+                    let alpha = match d {
+                        0 if lit => 1.0,
+                        0 | 1 => 0.55,
+                        2 => 0.34,
+                        _ => 0.16,
+                    };
+                    let size = if d == 0 { 17.0 } else { 13.5 };
+                    let line = &lines[index as usize].text;
+                    (ui::elide(line, budget, size), size, alpha)
+                } else {
+                    // 超出范围的占位：留空但保持行高，窗口不会忽高忽低
+                    (String::new(), 13.5, 0.0)
+                };
+
+                rows.push(
+                    container(
+                        text(label)
+                            .font(if step == 0 { icon::UI_BOLD } else { icon::UI_FONT })
+                            .size(size)
+                            .color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
+                            .width(Fill)
+                            .align_x(Horizontal::Center),
+                    )
+                    .height(Length::Fixed(LYRIC_ROW_H))
+                    .width(Fill)
+                    .align_y(Vertical::Center)
+                    .into(),
+                );
+            }
+
+            // 上下居中：窗口一高，七行歌词就贴着顶边了，看着像没画完
+            container(column(rows).spacing(2).width(Fill))
+                .center(Fill)
+                .into()
+        }
+    }
+}
+
+/// 歌词那块的一块「没什么可看」的占位。
+fn lyrics_hint(title: &'static str, hint: Option<&'static str>) -> Element<'static, Message> {
+    let mut col = column![text(title)
+        .font(icon::UI_FONT)
+        .size(14.0)
+        .color(Color::from_rgba(1.0, 1.0, 1.0, 0.42))]
+    .spacing(8)
+    .align_x(Alignment::Center);
+
+    if let Some(hint) = hint {
+        col = col.push(
+            text(hint)
+                .font(icon::UI_FONT)
+                .size(12.0)
+                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.26)),
+        );
+    }
+
+    container(col).center(Fill).into()
 }
 
 /// 包一层「只吃事件、不画任何东西」的按钮：浮层 / 抽屉用它挡住穿透
@@ -3873,6 +4112,34 @@ mod tests {
         // 新片首帧到了：标记清掉，圈立刻收
         app.stale_frame = false;
         assert_eq!(at!(STALE_SPIN_DELAY.as_millis() as u64 + 2000), 0.0);
+    }
+
+    /// 放音频时点界面不该暂停：歌词区要能点着看，封面也不是开关。
+    ///
+    /// `view()` 里音频那一支已经不挂按下/松手了，这里测的是 `update()` 里的保险：
+    /// 万一哪天手滑又挂回去，也不该把正在放的歌停掉。
+    #[test]
+    fn clicking_the_audio_stage_does_not_pause() {
+        let mut app = app();
+        app.current = Some(PathBuf::from("song.mp3"));
+        app.paused = false;
+
+        let _ = app.update(Message::StagePress);
+        let _ = app.update(Message::StageRelease);
+
+        assert!(!app.paused, "点音频界面不该把正在放的歌暂停");
+        assert!(!app.stage_press, "按下标志要收干净，别留给下一条视频");
+
+        // 视频那条路照旧：手上真有画面时点一下还是要暂停
+        app.current = Some(PathBuf::from("movie.mp4"));
+        app.frame = Some(video::VideoFrame {
+            data: std::sync::Arc::new(vec![0; 4]),
+            width: 1,
+            height: 1,
+        });
+        let _ = app.update(Message::StagePress);
+        let _ = app.update(Message::StageRelease);
+        assert!(app.paused, "视频画面点一下还是暂停");
     }
 
     /// 换片空档里按空格：手上那帧只是占位的，不该被当成「正在播」去翻暂停，
