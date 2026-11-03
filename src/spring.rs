@@ -79,8 +79,11 @@ impl Spring {
         self.position
     }
 
-    /// 目标在哪。滚轮要在这个值上累加（而不是在「现在在哪」上累加，
-    /// 否则连续快滚时会把还没走完的那一截吃掉）。
+    /// 目标在哪。
+    ///
+    /// 正式代码里没人用（滚轮累加走的是 `scroll + browse.value()` 那套显式偏移），
+    /// 只有单测要断言「偏移最终停在哪」。
+    #[cfg(test)]
     pub fn target(&self) -> f32 {
         self.target
     }

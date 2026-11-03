@@ -299,6 +299,9 @@ enum Message {
     LyricWheel(f32),
     /// 点了第几行歌词：跳到那一句
     LyricSeek(usize),
+    /// 点了抽屉外那层透明 cover。若那一下正好落在歌词面板里，就顺手当成点歌词 ——
+    /// 抽屉开着时 cover 会挡住歌词，不能让「点歌词跳转」平白失效。
+    CoverClick,
     /// 修饰键变了（只关心 Ctrl 按没按着 —— 它决定滚轮是调字号还是滚歌词）
     Modifiers(bool),
     /// 在画面上按下左键（只有真的按在画面上才会来，按在顶底栏会被它们先吃掉）
@@ -354,9 +357,7 @@ enum Message {
     OpenInfo,
     CloseInfo,
 
-    /// 点了抽屉/浮层外面的那层透明 cover：把它们全关掉
-    ClosePanels,
-
+    /// 什么都不做。用来「吃掉」事件 —— 比如抽屉上那层 button、cover 上的右键。
     Noop,
 }
 
@@ -1227,6 +1228,46 @@ impl App {
 
     fn touch(&mut self) {
         self.last_active = Instant::now();
+    }
+
+    /// 客户区坐标 `p` 落在歌词面板的哪一行上（不在面板里就是 `None`）。
+    ///
+    /// 几何必须和 `audio_stage` 摆歌词的那几行一致：左边 45% 给封面，歌词只占
+    /// 右栏的一半宽度，面板高 52% 夹在 240~420，整个面板在窗口里垂直居中
+    /// （`row![left, right].align_y(Center)` 套一层 `.center(Fill)`，两级居中
+    /// 叠起来就等于窗口居中）。
+    ///
+    /// 只给「抽屉开着、歌词被 cover 盖住」那条路用，但它本身跟 UI 无关，
+    /// 所以顺手也拿来做单测。
+    fn lyric_line_at(&self, p: Point) -> Option<usize> {
+        if !self.is_audio() {
+            return None;
+        }
+        let Some(meta::Lyrics::Synced(lines)) = &self.tags.lyrics else {
+            return None;
+        };
+        let (w, h) = (self.win_size.width, self.win_size.height);
+        let right_w = w * 0.55;
+        let text_w = right_w * 0.5;
+        let panel_h = (h * 0.52).clamp(240.0, 420.0);
+        let x0 = w * 0.45 + (right_w - text_w) * 0.5;
+        let y0 = h * 0.5 - panel_h * 0.5;
+        if p.x < x0 || p.x > x0 + text_w || p.y < y0 || p.y > y0 + panel_h {
+            return None;
+        }
+
+        let row_h = LYRIC_ROW_H * (self.lyric_size / LYRIC_SIZE_IDLE);
+        if row_h <= 0.0 {
+            return None;
+        }
+        let scroll = self.lyric_scroll.value() + self.lyric_browse.value();
+        let (first, pad) = lyric_layout(scroll, panel_h, row_h);
+        let rel = p.y - y0 - pad;
+        if rel < 0.0 {
+            return None;
+        }
+        let index = first + (rel / row_h) as usize;
+        (index < lines.len()).then_some(index)
     }
 
     /// 播放 / 暂停。键盘空格、点画面、点播放键都走这里。
@@ -2150,8 +2191,17 @@ impl App {
                 self.info_open = false;
             }
 
-            Message::ClosePanels => {
-                // 点了抽屉外面那层透明 cover
+            Message::CoverClick => {
+                // 点了抽屉外面那层透明 cover。
+                //
+                // 为什么不干脆把歌词层摆到 cover 上面：歌词面板是靠
+                // `row![left, right].align_y(Center)` 两级居中摆出来的，改成绝对
+                // 定位就得在渲染时自己算 y，字号一变、窗口一缩就容易对不齐。
+                // 与其挪布局，不如在这里按同一套几何反算一次点击落在哪一行。
+                let hit = self.cursor.and_then(|p| self.lyric_line_at(p));
+                if let Some(index) = hit {
+                    self.seek_to_lyric(index);
+                }
                 self.touch();
                 self.playlist.open = false;
                 self.settings.close();
@@ -2367,17 +2417,24 @@ impl App {
 
         let mut layers = stack![stage];
 
-        // 底栏先铺：抽屉打开时那层透明 cover 要压在**它上面**、顶栏**下面**，
-        // 于是点底栏那一带会关掉抽屉（而不是去按到按钮），顶栏还能拖动 / 关闭窗口。
-        layers = layers.push(
-            Float::new(self.bottom_bar())
-                .translate(move |_: Rectangle, _: Rectangle| Vector::new(0.0, bottom_shift)),
-        );
-
         // 全屏透明 cover：只吃点击，不画任何东西。点它就收起抽屉 / 浮层。
         if self.any_drawer() {
             layers = layers.push(self.cover_layer());
         }
+
+        // 底栏压在 cover **上面**。
+        //
+        // 以前它铺在 cover 底下（想着「抽屉开着时点底栏那一带先关抽屉」），结果
+        // 抽屉一开，进度条、播放键、歌词点击**全被 cover 吃掉** —— 用户看到的就是
+        // 「播放时点进度条没反应、点歌词也不跳」。现在反过来：播放控制任何时候
+        // 都能直接按，点别处的空白照样关抽屉。
+        //
+        // 抽屉本身上下让出了 `BOTTOM_H`，跟底栏不会重叠，所以顺序换成这样也不会
+        // 挡住抽屉底部的按钮。
+        layers = layers.push(
+            Float::new(self.bottom_bar())
+                .translate(move |_: Rectangle, _: Rectangle| Vector::new(0.0, bottom_shift)),
+        );
 
         // 三条右侧抽屉：夹在 cover 和顶栏之间。
         // 上下让出 TOP_H / BOTTOM_H，抽屉不会盖住窗口按钮和播放控制；
@@ -2832,7 +2889,10 @@ impl App {
                 .color(icon::TEXT_DIM),
             slider(0.0..=total, self.position, Message::Seek)
                 .width(Fill)
-                .height(18.0)
+                // 高度只决定**命中区**：iced 的 slider 把轨道画在 bounds 的正中，
+                // 手柄也跟着居中，所以 26 跟 18 看起来一模一样，但可点范围从
+                // 上下各 9px 变成各 13px —— 手一抖就点空的情况少很多。
+                .height(26.0)
                 .style(progress_slider_style),
             text(fmt_time(self.duration))
                 .font(icon::UI_FONT)
@@ -3127,7 +3187,9 @@ impl App {
     /// 点画面 / 点底栏 → 关抽屉；点顶栏 → 照常拖窗口、最小化、关闭。
     fn cover_layer(&self) -> Element<'_, Message> {
         mouse_area(container(space()).width(Fill).height(Fill))
-            .on_press(Message::ClosePanels)
+            // `CoverClick` 而不是原来那个直接关抽屉的消息：它还多看一眼
+            // 「这一下是不是点在歌词那一片」，是的话先跳过去再关抽屉。
+            .on_press(Message::CoverClick)
             // 右键也吃掉：否则抽屉开着时右击画面会在抽屉上面再叠一个右键菜单。
             // 这里刻意用 Noop —— 抽屉开着时右键不该有任何动作。
             .on_right_press(Message::Noop)
@@ -4319,7 +4381,7 @@ mod tests {
         assert!(!app.info_open, "开播放列表要把详情抽屉收起来");
 
         // 点透明 cover 全关
-        let _ = app.update(Message::ClosePanels);
+        let _ = app.update(Message::CoverClick);
         assert!(!app.playlist.open);
         assert!(!app.any_drawer());
 
@@ -4696,6 +4758,88 @@ mod tests {
         assert_eq!(app.lyric_line, Some(3));
         assert_eq!(app.lyric_scroll.value(), 3.0, "歌词要当场落位");
         assert_eq!(app.lyric_browse.value(), 0.0, "跳转之后滚动偏移要清零");
+    }
+
+    /// 抽屉开着的时候，那层透明 cover 会盖住歌词。点下去不能白费：
+    /// 既要跳到点中的那一句，也要把抽屉关掉。
+    #[test]
+    fn a_cover_click_over_the_lyrics_still_seeks() {
+        let mut app = app();
+        app.current = Some(PathBuf::from("song.mp3"));
+        app.duration = 100.0;
+        app.position = 0.0;
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..6)
+                .map(|i| meta::Line {
+                    at: i as f64 * 10.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(2);
+        app.lyric_scroll.snap(2.0);
+        app.playlist.open = true;
+
+        // 歌词面板正中：面板在窗口里垂直居中，横向占右栏的中间一半
+        let (w, h) = (app.win_size.width, app.win_size.height);
+        let text_w = w * 0.55 * 0.5;
+        let cx = w * 0.45 + (w * 0.55 - text_w) * 0.5 + text_w * 0.5;
+        app.cursor = Some(Point::new(cx, h * 0.5));
+
+        let _ = app.update(Message::CoverClick);
+
+        assert_eq!(app.position, 20.0, "正中那行是第 2 句，要跳到它唱的地方");
+        assert!(!app.playlist.open, "顺手还得把抽屉关掉");
+    }
+
+    /// 同一层 cover，点在歌词面板外面（封面那边）：只关抽屉，不动播放位置。
+    #[test]
+    fn a_cover_click_outside_the_lyrics_just_closes_the_drawer() {
+        let mut app = app();
+        app.current = Some(PathBuf::from("song.mp3"));
+        app.duration = 100.0;
+        app.position = 42.0;
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..6)
+                .map(|i| meta::Line {
+                    at: i as f64 * 10.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+        app.lyric_line = Some(2);
+        app.lyric_scroll.snap(2.0);
+        app.playlist.open = true;
+
+        // 左边 45% 是封面区，不该算点歌词
+        let (w, h) = (app.win_size.width, app.win_size.height);
+        app.cursor = Some(Point::new(w * 0.2, h * 0.5));
+
+        let _ = app.update(Message::CoverClick);
+
+        assert_eq!(app.position, 42.0, "点封面不该动播放位置");
+        assert!(!app.playlist.open, "抽屉照样关掉");
+    }
+
+    /// 视频没有歌词面板，那套几何不生效 —— 点哪儿都只关抽屉。
+    #[test]
+    fn the_lyrics_hit_box_only_exists_in_audio_mode() {
+        let mut app = app();
+        app.current = Some(PathBuf::from("movie.mp4"));
+        app.tags.lyrics = Some(meta::Lyrics::Synced(
+            (0..6)
+                .map(|i| meta::Line {
+                    at: i as f64 * 10.0,
+                    text: format!("第 {} 句", i + 1),
+                })
+                .collect(),
+        ));
+
+        let (w, h) = (app.win_size.width, app.win_size.height);
+        assert!(
+            app.lyric_line_at(Point::new(w * 0.75, h * 0.5)).is_none(),
+            "视频模式下不该有歌词命中区"
+        );
     }
 
     /// 滚轮量：鼠标一格（Lines）和触摸板（Pixels）都要换算成内向的行数。

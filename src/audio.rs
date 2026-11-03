@@ -139,10 +139,21 @@ impl AudioEngine {
 
     /// 跳到第 `t` 秒。rodio 的 `try_seek` 会阻塞 0~5ms 等音频线程确认，
     /// 所以只在播放线程里调。
+    ///
+    /// 失败**不能默默吞掉**：`try_seek` 对不支持的源会返回 Err，界面那边照样
+    /// 把进度条和歌词挪过去了，用户听到的却还是原来那段 —— 看着就是「点了没反应」。
+    /// release 下没法往界面上弹（会把整块播放界面换成错误面板），至少在 debug
+    /// 里留一条能被捞出来的日志。
     pub fn seek(&self, t: f64) {
         let Some(sink) = &self.sink else { return };
         let t = t.max(0.0);
-        let _ = sink.try_seek(Duration::from_secs_f64(t));
+        let result = sink.try_seek(Duration::from_secs_f64(t));
+        #[cfg(debug_assertions)]
+        match &result {
+            Ok(()) => eprintln!("audio-seek: {t:.2}s ok"),
+            Err(e) => eprintln!("audio-seek: {t:.2}s 失败：{e:?}"),
+        }
+        let _ = result;
     }
 
     /// 音量：界面用的是 0~100，rodio 要的是线性增益（1.0 = 原音量）。
