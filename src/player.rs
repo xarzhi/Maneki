@@ -217,8 +217,16 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
                             }
                         }
                         if let Some(e) = audio_engine.as_mut() {
-                            match e.load(&path) {
-                                Ok(()) => {
+                            // 解码器内部 panic 过：rodio 的 symphonia 后端在初始化
+                            // 阶段遇到 SeekError 时会走 `unreachable!()`（m4a 就踩到
+                            // 过），panic 会顺着这条播放线程一路炸上去 —— 线程一死，
+                            // 整个播放器就再也不出声了，用户看到的是「点了没反应」。
+                            // 所以这里必须兜住：panic 只算「这个文件放不了」。
+                            let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                || e.load(&path),
+                            ));
+                            match loaded {
+                                Ok(Ok(())) => {
                                     // 新 Sink 的音量/倍速都是默认值，得重新下发
                                     e.set_volume(volume);
                                     e.set_speed(speed);
@@ -226,8 +234,19 @@ fn run(mpv: Mpv, cmd_rx: Receiver<Cmd>, snap_tx: SyncSender<Snapshot>) {
                                     rodio_active = true;
                                     open_ms = open_at.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                                 }
-                                Err(msg) => {
+                                Ok(Err(msg)) => {
                                     snap.error = Some(msg);
+                                    open_at = None;
+                                }
+                                Err(_) => {
+                                    // 炸过一次之后 Sink 是半成品，先清干净：
+                                    // 留着它，下一次 load 会接着用这个坏管子。
+                                    e.stop();
+                                    rodio_active = false;
+                                    snap.error = Some(
+                                        "这个音频文件解不了：\n解码器内部出错（格式不受支持）"
+                                            .to_string(),
+                                    );
                                     open_at = None;
                                 }
                             }

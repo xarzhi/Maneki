@@ -1,15 +1,15 @@
-//! 纯音频播放：rodio（cpal 送 WASAPI，symphonia 解码）。
+//! 纯音频播放：rodio（cpal 送 WASAPI，symphonia / hound 解码）。
 //!
 //! 为什么不干脆也交给 mpv：mpv 那条路要起一整个实例，还得每帧把画面软件渲染成
 //! RGBA —— 放一首 mp3 也占着 1080p 的像素缓冲，纯属浪费。rodio 直接往声卡送采样，
 //! 内存只有解码器那点缓冲，暂停/跳转也不用绕一层属性系统。
 //!
-//! 但 rodio 只认 flac / wav / ogg / mp3 / m4a(aac)。wma、ape、opus、mka 这些
-//! 它解不了，`player.rs` 会把它们**回退给 mpv** 放（mpv 本来就能放纯音频，
-//! 只是没有画面而已）。所以这里有两张表：
+//! 但 rodio 的覆盖面比想象的窄：wma、ape、opus、mka 它解不了；flac 和 m4a 虽然
+//! 解得了，**seek 却不行**（详见 [`RODIO_EXTS`] 上的说明）。这些 `player.rs` 都会
+//! **回退给 mpv** 放 —— mpv 本来就能放纯音频，只是没有画面而已。所以这里有两张表：
 //!
 //! - [`is_audio`]：这是不是音频文件（决定要不要走「音频模式」的界面和状态处理）
-//! - [`is_rodio`]：rodio 能不能解码它（决定用哪个后端）
+//! - [`is_rodio`]：这个文件走 rodio 后**拖不拖得动进度条**（决定用哪个后端）
 
 use std::path::Path;
 use std::time::Duration;
@@ -26,17 +26,28 @@ pub const AUDIO_EXTS: &[&str] = &[
     "dff", "mid", "midi", "caf", "ra", "au", "snd",
 ];
 
-/// rodio 能解码的扩展名。和 [`AUDIO_EXTS`] 的交集才是「走 rodio」。
+/// rodio 能解码**并且能 seek** 的扩展名。和 [`AUDIO_EXTS`] 的交集才是「走 rodio」。
 ///
-/// - flac → claxon
-/// - wav → hound
-/// - ogg/oga → lewton(vorbis)
-/// - mp3 → symphonia
-/// - m4a/aac → symphonia(isomp4 + aac)
+/// 判据不是「解不解得开」，而是「拖不拖得动进度条」。这里踩过两个坑，都是
+/// 实测出来的（`audio-seek` 那行日志就是为这个留的）：
 ///
-/// `opus` 故意不在这里：ogg 容器里的 opus 走的是 symphonia 的 ogg 解复用，
-/// rodio 0.19 没开这条，交给 mpv 更稳。
-const RODIO_EXTS: &[&str] = &["mp3", "flac", "wav", "wave", "ogg", "oga", "m4a", "m4b", "aac"];
+/// - **flac**：rodio 原生后端是 claxon，`try_seek` 直接返回 `NotSupported`；
+///   换成 symphonia-flac 也不行 —— 它的二分查找要 `MediaSourceStream::byte_len()`，
+///   而 rodio 包源的 `ReadSeekSource::byte_len()` 恒为 `None`，于是
+///   `SeekError::Unseekable`。这条路被 rodio 自己堵死了。
+/// - **m4a / aac**（symphonia-isomp4）：初始化阶段就可能抛 SeekError，rodio 里
+///   对应分支写的是 `unreachable!("Seek errors should not occur during
+///   initialization")` —— 直接 panic，整条播放线程没了，表现是「一点声音都没有」。
+///
+/// 所以这两个都交给 mpv（`player.rs` 里 `is_rodio` 为 false 就走 mpv，纯音频
+/// mpv 照放，只是没画面）。留在表里的只有实测能 seek 的：
+///
+/// - mp3 → symphonia（不是 minimp3，minimp3 的 seek 也没实现）
+/// - wav/wave → hound（它自己实现了按采样数定位）
+///
+/// `opus` 从来就不在：ogg 容器里的 opus 走 symphonia 的 ogg 解复用，
+/// rodio 0.19 没开这条，一直是交给 mpv 的。
+const RODIO_EXTS: &[&str] = &["mp3", "wav", "wave"];
 
 fn ext_of(path: &Path) -> Option<String> {
     path.extension()
@@ -205,13 +216,24 @@ mod tests {
     }
 
     #[test]
-    fn only_rodio_decodable_ones_go_to_rodio() {
+    fn only_seekable_audio_goes_to_rodio() {
+        // rodio 这边只剩实测能拖进度条的两个
         assert!(is_rodio(&p("a.mp3")));
-        assert!(is_rodio(&p("a.m4a")));
-        assert!(is_rodio(&p("a.FLAC")));
-        // wma / ape 是音频，但 rodio 解不了 —— 这两个必须回退给 mpv
+        assert!(is_rodio(&p("a.wav")));
+        assert!(is_rodio(&p("a.WAVE")));
+
+        // 解不开的：rodio 没这些解码器
         assert!(is_audio(&p("a.wma")) && !is_rodio(&p("a.wma")));
         assert!(is_audio(&p("a.ape")) && !is_rodio(&p("a.ape")));
+
+        // 解得出、但**拖不动**的：flac 缺 byte_len、m4a 会 panic、ogg 的
+        // lewton 没实现 seek。这三个必须回退给 mpv，否则用户看到的就是
+        // 「界面挪了、声音没动」。
+        for name in ["a.flac", "a.FLAC", "a.m4a", "a.aac", "a.ogg", "a.oga"] {
+            assert!(is_audio(&p(name)), "{name} 是音频");
+            assert!(!is_rodio(&p(name)), "{name} 不能走 rodio：它 seek 不了");
+        }
+
         // 视频永远不走 rodio
         assert!(!is_rodio(&p("a.mp4")));
     }

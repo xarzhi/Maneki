@@ -10,8 +10,25 @@ rfd = "0.17.2"
 # 音频播放（视频和其余音频格式还是 libmpv；rodio 只管纯音频，省得为了一首歌
 # 也去起一套 libmpv 的软渲染）
 #
-# 默认特性是 flac/vorbis/wav/mp3；aac + isomp4 是补上 m4a/aac。
-rodio = { version = "0.19", features = ["symphonia-aac", "symphonia-isomp4"] }
+# **只留 mp3 和 wav**，其余一律交给 mpv。挑的标准不是「解不解得开」，而是
+# 「拖不拖得动进度条」—— rodio 0.19 里能 seek 的只有这两个后端：
+#
+#   mp3  = symphonia-mp3   → symphonia 的 demuxer seek，实测能用
+#   wav  = hound           → 自己按采样数定位，实测能用
+#
+# 踩过的坑（都实测过，别想着再开回来）：
+#
+# - **flac**：原生后端 claxon 的 `try_seek` 是 `Err(NotSupported)`；
+#   换 symphonia-flac 也不行 —— 它二分查找要 `MediaSourceStream::byte_len()`，
+#   而 rodio 包源的 `ReadSeekSource::byte_len()` 恒为 `None` → `Unseekable`。
+#   这条路是 rodio 自己堵死的，除非不用 rodio::Decoder。
+# - **m4a / aac**（symphonia-isomp4）：初始化阶段抛 SeekError 时 rodio 走的是
+#   `unreachable!()`，直接 panic，整条播放线程没了 —— 表现是「一点声音都没有」，
+#   比不能 seek 严重得多。
+# - **ogg / vorbis**：lewton 的 seek 同样没实现。
+#
+# `minimp3` 也不能开：它的 `try_seek` 也是 NotSupported（源码里留着 TODO）。
+rodio = { version = "0.19", default-features = false, features = ["wav", "mp3"] }
 
 # 音频的封面 / 歌词 / 曲名歌手：读标签只认 lofty（ID3、Vorbis、MP4、APE 一把抓）。
 # iced 开的是 `image-without-codecs`（它自己不解码），所以封面得我们自己解：
