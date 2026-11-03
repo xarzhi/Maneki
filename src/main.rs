@@ -57,10 +57,13 @@ const SEEK_STEP: f64 = 5.0;
 const VOL_STEP: f64 = 5.0;
 /// 音频舞台左边那块封面的边长上限（窗口窄的时候按比例缩）
 const ART_SIZE: f32 = 220.0;
-/// 歌词窗：当前行上下各显示几行（算上当前行一共 7 行）
-const LYRIC_WINDOW: isize = 3;
+/// 歌词窗：离当前行超过这么多行就彻底淡掉（再远的本来也在视口外）
+const LYRIC_FADE_ROWS: usize = 6;
 /// 歌词窗里一行占多高。定死高度，换行时整块才不会一抖一抖
 const LYRIC_ROW_H: f32 = 26.0;
+/// 歌词换行时的上移过渡有多慢。比抽屉（`ANIM_TAU`）慢不少 ——
+/// 快了就像直接跳过去，慢一点才有「滑上来」的感觉
+const LYRIC_TAU: f32 = 0.19;
 /// 光晕呼吸一圈要几秒
 const AUDIO_PULSE: f32 = 4.2;
 /// 音频舞台的底色：比纯黑亮一档的冷灰，中间那块「唱片」才浮得起来
@@ -367,6 +370,11 @@ struct App {
     cover: Option<iced::widget::image::Handle>,
     /// 同步歌词当前唱到第几行（没歌词 / 纯文本歌词时是 `None`）
     lyric_line: Option<usize>,
+    /// 歌词**画在第几行的高度**，可以是小数。
+    ///
+    /// 换句时它慢慢追上 `lyric_line`（见 `animate` 里的 `LYRIC_TAU`），
+    /// 界面按它算整块歌词往上挪多少 —— 一步滑上去，不是直接跳。
+    lyric_scroll: f32,
     /// 后台读标签的线程（第一次播音频时才创建，不拖慢启动）
     tag_loader: Option<meta::Loader>,
     paused: bool,
@@ -503,6 +511,7 @@ impl App {
             tags: meta::Meta::default(),
             cover: None,
             lyric_line: None,
+            lyric_scroll: 0.0,
             tag_loader: None,
             paused: true,
             pause_sent: None,
@@ -644,6 +653,7 @@ impl App {
         self.tags = meta::Meta::default();
         self.cover = None;
         self.lyric_line = None;
+        self.lyric_scroll = 0.0;
         if audio::is_audio(&path) {
             if self.tag_loader.is_none() {
                 self.tag_loader = meta::Loader::spawn();
@@ -689,6 +699,7 @@ impl App {
         self.tags = meta::Meta::default();
         self.cover = None;
         self.lyric_line = None;
+        self.lyric_scroll = 0.0;
         // 代次也往前推一格：在途的旧快照（还是上一条片子的画面/进度）一律不认，
         // 否则刚清空的界面会被它们重新填回旧数字。
         self.load_gen = self.load_gen.wrapping_add(1);
@@ -949,6 +960,12 @@ impl App {
         if self.is_audio() && !self.paused {
             self.pulse = (self.pulse + dt / AUDIO_PULSE) % 1.0;
         }
+
+        // 歌词换行走自己的时间常数：比抽屉慢，才有「往上滑一句」的感觉。
+        // 目标就是当前该唱的那一行；一句都没有时回到顶上。
+        let kl = 1.0 - (-dt / LYRIC_TAU).exp();
+        let line = self.lyric_line.unwrap_or(0) as f32;
+        self.lyric_scroll = approach(self.lyric_scroll, line, kl);
     }
 
     /// 换片转圈现在的不透明度（0 = 不画，1 = 完全显示）。
@@ -1040,8 +1057,10 @@ impl App {
                 .take()
                 .map(|c| iced::widget::image::Handle::from_rgba(c.width, c.height, c.rgba));
             self.tags = tags;
-            // 新歌词就从当前播放位置重新对一次行，不然要等下一次 tick 才亮
+            // 新歌词就从当前播放位置重新对一次行，不然要等下一次 tick 才亮。
+            // 位置也直接定位过去：不然第一句会从顶上滑下来，像放错了歌。
             self.lyric_line = self.tags.lyrics.as_ref().and_then(|l| l.index_at(self.position));
+            self.lyric_scroll = self.lyric_line.unwrap_or(0) as f32;
         }
     }
 
@@ -2375,13 +2394,19 @@ impl App {
         };
         let glow = 0.04 + 0.09 * breath;
 
-        // 两栏都按窗口宽度伸缩：封面 19%、歌词 34%，各自有上下限。
-        // 560 宽（程序允许的最小宽度）下两栏也并得下，不会挤成一条缝。
-        let side = (self.win_size.width * 0.19).clamp(112.0, ART_SIZE);
-        let lyrics_w = (self.win_size.width * 0.34).clamp(200.0, 420.0);
-        // 歌词窗一行 26，七行加间距要 194 —— 窗口太矮时封面会缩到 112，
-        // 那点高度摆不下七行，所以歌词这一栏至少 196 高。
-        let panel_h = side.max(196.0);
+        // 舞台横向一刀切：封面那块占 45%，歌词容器占 55%。
+        let left_w = self.win_size.width * 0.45;
+        let right_w = self.win_size.width * 0.55;
+
+        // 封面在它那 45% 里再缩一圈（留白），同时受高度限制：
+        // 下面还要放曲名和歌手，别把两行字挤出屏幕。
+        let room = (self.win_size.height - TOP_H - BOTTOM_H - 110.0).max(140.0);
+        let side = (left_w * 0.78).clamp(120.0, ART_SIZE).min(room);
+
+        // 歌词容器比封面高不少：上下多出来的那截正好给歌词做渐变留白。
+        let panel_h = (self.win_size.height * 0.52).clamp(240.0, 420.0);
+        // 歌词正文只占容器宽度的一半，居中 —— 一行太长反而不好跟
+        let text_w = right_w * 0.5;
 
         // 有内嵌封面就贴封面；没有还是原来那只猫
         let art: Element<'_, Message> = match &self.cover {
@@ -2460,18 +2485,22 @@ impl App {
 
         let left = column![art, info]
             .spacing(20)
-            .width(Length::Fixed(side + 40.0))
+            .width(Length::Fixed(left_w))
             .align_x(Alignment::Center);
 
         let right = container(lyrics_view(
             self.tags.lyrics.as_ref(),
             self.lyric_line,
-            lyrics_w,
+            self.lyric_scroll,
+            text_w,
+            panel_h,
         ))
-        .width(Length::Fixed(lyrics_w))
-        .height(Length::Fixed(panel_h));
+        .width(Length::Fixed(right_w))
+        .height(Length::Fixed(panel_h))
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center);
 
-        container(row![left, right].spacing(36).align_y(Alignment::Center))
+        container(row![left, right].align_y(Alignment::Center))
             .center(Fill)
             .style(|_| container::Style {
                 background: Some(Background::Color(AUDIO_BG)),
@@ -2959,24 +2988,37 @@ impl App {
 
 /// 歌词面板：三种情况各画各的。
 ///
-/// - **同步歌词**：取当前行上下各三行，一共七行固定高度 —— 当前行永远在正中间，
-///   像 KTV。不用 `scrollable` 是因为 iced 里让列表自己滚到某一行得走窗口操作，
-///   每换一句就要发一次任务；七行窗口既不用算偏移，也不会因为滚动动画拖泥带水。
+/// - **同步歌词**：整列每行 `LYRIC_ROW_H` 高的文字，外面套一个 `clip(true)` 的
+///   固定尺寸容器，靠**顶部留白**把当前行顶到容器中线上。留白是连续值
+///   （`scroll` 可以是小数），所以换句时整块是平滑往上滑，不是一格一格跳。
+///   （iced 没有「滚到某一行」的直给接口，自己算留白反而最省事，也不会冒出
+///   滚动条、惯性这些东西抢戏。）
 /// - **纯文本歌词**：没有时间轴对不了行，就给一个能自己滚的列表。
 /// - **没有歌词**：说一句，别留一块空白让人以为界面挂了。
 fn lyrics_view<'a>(
     lyrics: Option<&'a meta::Lyrics>,
     current: Option<usize>,
+    scroll: f32,
     width: f32,
+    height: f32,
 ) -> Element<'a, Message> {
     // 一行歌词最多这么宽：留 8px 给右边，免得贴着栏边
     let budget = (width - 8.0).max(40.0);
 
     let Some(lyrics) = lyrics else {
-        return lyrics_hint("没有歌词", Some("把同名 .lrc 放在音乐旁边，或写进标签里"));
+        return container(lyrics_hint(
+            "没有歌词",
+            Some("把同名 .lrc 放在音乐旁边，或写进标签里"),
+        ))
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(height))
+        .into();
     };
     if lyrics.len() == 0 {
-        return lyrics_hint("歌词是空的", None);
+        return container(lyrics_hint("歌词是空的", None))
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height))
+            .into();
     }
 
     match lyrics {
@@ -2997,42 +3039,46 @@ fn lyrics_view<'a>(
             .spacing(7)
             .width(Fill);
 
-            iced::widget::scrollable(body)
-                .height(Fill)
-                .width(Fill)
+            container(iced::widget::scrollable(body).height(Fill).width(Fill))
+                .width(Length::Fixed(width))
+                .height(Length::Fixed(height))
                 .into()
         }
         meta::Lyrics::Synced(lines) => {
             // 前奏（一句都还没到）时也把第 0 行摆在正中间，只是不点亮：
-            // 第一句真的唱出来时只有颜色变化，整块歌词不会往上跳一格。
+            // 第一句真的唱出来时只有颜色变化，整块歌词不会先跳一格子。
             let active = current.unwrap_or(0).min(lines.len() - 1);
             let lit = current.is_some();
 
-            let mut rows: Vec<Element<'a, Message>> =
-                Vec::with_capacity((LYRIC_WINDOW * 2 + 1) as usize);
-            for step in -LYRIC_WINDOW..=LYRIC_WINDOW {
-                let index = active as isize + step;
-                let (label, size, alpha) = if index >= 0 && (index as usize) < lines.len() {
-                    let d = step.unsigned_abs();
-                    // 越远越淡：当前行亮白，上下第一行半亮，再往外基本只剩个轮廓
-                    let alpha = match d {
-                        0 if lit => 1.0,
-                        0 | 1 => 0.55,
-                        2 => 0.34,
-                        _ => 0.16,
-                    };
-                    let size = if d == 0 { 17.0 } else { 13.5 };
-                    let line = &lines[index as usize].text;
-                    (ui::elide(line, budget, size), size, alpha)
+            let (first, pad) = lyric_layout(scroll, height);
+            // 容器里放得下几行，多给两行当过渡用
+            let count = (height / LYRIC_ROW_H).ceil() as usize + 2;
+
+            let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(count + 1);
+            rows.push(space().height(Length::Fixed(pad)).into());
+
+            for i in first..lines.len().min(first + count) {
+                let d = i.abs_diff(active);
+                // 越远越淡：当前行亮白，上下第一行半亮，六行开外就看不见了
+                let alpha = if d == 0 && lit {
+                    1.0
                 } else {
-                    // 超出范围的占位：留空但保持行高，窗口不会忽高忽低
-                    (String::new(), 13.5, 0.0)
+                    match d {
+                        0 | 1 => 0.60,
+                        2 => 0.44,
+                        3 => 0.30,
+                        4 => 0.18,
+                        5 => 0.10,
+                        _ if d <= LYRIC_FADE_ROWS => 0.05,
+                        _ => 0.0,
+                    }
                 };
+                let size = if d == 0 { 17.0 } else { 13.5 };
 
                 rows.push(
                     container(
-                        text(label)
-                            .font(if step == 0 { icon::UI_BOLD } else { icon::UI_FONT })
+                        text(ui::elide(&lines[i].text, budget, size))
+                            .font(if d == 0 { icon::UI_BOLD } else { icon::UI_FONT })
                             .size(size)
                             .color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
                             .width(Fill)
@@ -3045,12 +3091,28 @@ fn lyrics_view<'a>(
                 );
             }
 
-            // 上下居中：窗口一高，七行歌词就贴着顶边了，看着像没画完
-            container(column(rows).spacing(2).width(Fill))
-                .center(Fill)
+            // clip：滑到一半时，上下溢出的行不能画到容器外面去
+            container(column(rows).width(Fill))
+                .width(Length::Fixed(width))
+                .height(Length::Fixed(height))
+                .clip(true)
                 .into()
         }
     }
+}
+
+/// 同步歌词要「从第几行开始画」和「顶部留白多高」。
+///
+/// 留白是连续的：换句时它一点点变小，整块歌词就平滑地往上滑一行，而不是一格
+/// 一格地跳。唯一要小心的约束是**留白不能为负**（iced 没有负 padding），所以
+/// 起始行要跟着 `scroll` 一起往前挪 —— `scroll` 走一行，`first` 也走一行。
+///
+/// 返回值保证：`pad >= 0`，且第 `scroll` 行的顶边正好在 `height/2 - 行高/2`。
+fn lyric_layout(scroll: f32, height: f32) -> (usize, f32) {
+    let half = height * 0.5 - LYRIC_ROW_H * 0.5;
+    let first = (scroll - half / LYRIC_ROW_H).ceil().max(0.0) as usize;
+    let pad = (half - (scroll - first as f32) * LYRIC_ROW_H).max(0.0);
+    (first, pad)
 }
 
 /// 歌词那块的一块「没什么可看」的占位。
@@ -4112,6 +4174,45 @@ mod tests {
         // 新片首帧到了：标记清掉，圈立刻收
         app.stale_frame = false;
         assert_eq!(at!(STALE_SPIN_DELAY.as_millis() as u64 + 2000), 0.0);
+    }
+
+    /// 歌词窗的留白必须「不为负 + 连续 + 当前行贴着中线」。
+    ///
+    /// 这三条一破，换句时的「往上滑」就会变成跳一格、或者整块卡住不动。
+    #[test]
+    fn lyric_window_slides_continuously_and_keeps_the_line_centered() {
+        for height in [240.0f32, 300.0, 374.0, 420.0] {
+            let half = height * 0.5 - LYRIC_ROW_H * 0.5;
+            let mut last_y: Option<f32> = None;
+
+            // 0 → 30 行，每帧推进 0.1 行（比 60fps 下的真实速度还慢，够密了）
+            for step in 0..=300 {
+                let scroll = step as f32 * 0.1;
+                let (first, pad) = lyric_layout(scroll, height);
+
+                assert!(pad >= 0.0, "留白不能是负的（iced 没有负 padding）");
+
+                // 当前行（第 scroll 行）的顶边要一直贴在中线上
+                let top = pad + (scroll - first as f32) * LYRIC_ROW_H;
+                assert!(
+                    (top - half).abs() < 0.51,
+                    "当前行要贴在中线：{top} vs {half}（height={height}）"
+                );
+
+                // 截取第 10 行：只要它还在渲染范围里，纵向位置就该连续地往上走
+                let i = 10usize;
+                if i >= first {
+                    let y = pad + (i - first) as f32 * LYRIC_ROW_H;
+                    if let Some(prev) = last_y {
+                        assert!(
+                            (y - prev).abs() <= 0.1 * LYRIC_ROW_H + 0.05,
+                            "整块要连续滑动，不能跳：{prev} → {y}"
+                        );
+                    }
+                    last_y = Some(y);
+                }
+            }
+        }
     }
 
     /// 放音频时点界面不该暂停：歌词区要能点着看，封面也不是开关。
