@@ -7,6 +7,7 @@ use libloading::Library;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 const FORMAT_STRING: c_int = 1;
 const FORMAT_INT64: c_int = 4;
@@ -320,8 +321,17 @@ impl Mpv {
                 options.push(("ao", "null".into()));
                 options.push(("aid", "no".into()));
                 options.push(("pause", "yes".into()));
-                // 缩略图小，别让 mpv 为它启多线程解码抢 CPU
-                options.push(("vd-lavc-threads", "1".into()));
+                // 抽帧要快，因为它每次都要从关键帧解到目标帧。4K HDR 的片子上
+                // 单线程解码一次要 1.4 秒（实测），多开几条能把等待压下来，
+                // 而它只在鼠标停在进度条上时才动，平时是闲着的。
+                options.push(("vd-lavc-threads", "0".into()));
+                // 缩略图只有 160 宽，去块滤波的细节根本看不出来，跳过它省一大截
+                // 解码时间（H.264/HEVC 上很可观）。
+                options.push(("vd-lavc-skiploopfilter", "all".into()));
+                // 缩放用双线性就够了：3840→160 之后三次插值和双线性看不出差别，
+                // 但双线性快得多。
+                options.push(("scale", "bilinear".into()));
+                options.push(("dscale", "bilinear".into()));
             }
 
             for (k, v) in &options {
@@ -622,6 +632,39 @@ impl Mpv {
         unsafe {
             (self.set_property)(self.ctx, n.as_ptr(), FORMAT_DOUBLE, &mut v as *mut f64 as *mut c_void);
         }
+    }
+
+    /// 等 mpv 把「寻址完成，可以继续播」那条事件发出来。
+    ///
+    /// 抽帧必须靠这条事件判断寻址结束，不能靠 `time-pos`：
+    /// `time-pos` 是**命令一发出就变**的，画面却还在从关键帧往后解。
+    /// 也不要靠轮询渲染上下文 —— `needs_render` 是一次性标志，寻址期间读掉
+    /// 就再也等不到了（暂停状态下 mpv 只在寻址完成时再发一次）。
+    ///
+    /// 返回 false 表示超时或者文件已经结束（调用方自己决定要不要硬画一帧）。
+    pub fn wait_seek_done(&self, timeout: Duration) -> bool {
+        #[repr(C)]
+        struct Ev {
+            event_id: c_int,
+            _error: c_int,
+            _reply: u64,
+            _data: *mut c_void,
+        }
+
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let ev = unsafe { (self.wait_event)(self.ctx, 0.02) };
+            if ev.is_null() {
+                continue;
+            }
+            match unsafe { (*(ev as *const Ev)).event_id } {
+                21 => return true,  // MPV_EVENT_PLAYBACK_RESTART
+                7 => return false,  // MPV_EVENT_END_FILE
+                0 => std::thread::sleep(Duration::from_millis(4)), // MPV_EVENT_NONE
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn get_f64(&self, name: &str) -> Option<f64> {

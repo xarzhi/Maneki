@@ -13,9 +13,9 @@
 //! 完全不阻塞。
 //!
 //! 抽帧的坑在「seek 之后什么时候那张图才画出来」：`time-pos` 一改就立刻读
-//! 渲染上下文，读到的往往还是**上一帧**（拖过去的那一帧还在解）。所以这里
-//! 先看 `time-pos` 是不是真的到了目标位置，再丢掉所有「位置不对」的帧，
-//! 直到位置对上、且渲染上下文报了新帧，才认为拿到了。
+//! 渲染上下文，读到的往往是**纯黑底色**（目标帧还在从关键帧往后解）。所以这里
+//! 认 mpv 的 `playback-restart` 事件（寻址完成的信号），等它到了再取帧，
+//! 并且用「整块全零」而不是「平均亮度」来判断空底 —— 细节见 [`grab`]。
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -36,9 +36,15 @@ const QUEUE_MAX: usize = 8;
 /// 打开文件最多等多久（大文件、网络盘上 open 会慢）
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// 单帧最多等多久。超时就放弃这一格，界面继续保持「没有预览」。
-const FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
-/// seek 之后 `time-pos` 允许的误差。命中式 seek 一般能精确到帧。
-const POS_EPS: f64 = 0.35;
+///
+/// 这个值是按最坏情况定的：4K HDR 的片子上，一次精确定位要从关键帧一路解到
+/// 目标位置，实测 1.4 秒起步（还是多线程 + 跳过去块的情况下）。给 5 秒是留够
+/// 余量 —— 反正它只在鼠标停住时才跑，等久一点比「弹出个黑的」强。
+const FRAME_TIMEOUT: Duration = Duration::from_millis(5000);
+/// 连续拿到几帧「纯黑」就认定这个位置真的是黑的，别再等了。
+/// 一两帧黑是正常的（解码器还没把画面交出来，渲染上下文先画了个底色），
+/// 每帧都是黑的话那就是画面本身黑，等下去也没用。
+const BLANK_TRIES: u32 = 3;
 
 /// 缓存键：哪条片子 + 第几个桶
 pub type Key = (String, i64);
@@ -56,6 +62,9 @@ struct Job {
     path: PathBuf,
     key: Key,
     at: f64,
+    /// 这是线程自己顺手预取的一格（不是用户指着的那格）。
+    /// 预取的结果只进缓存、不继续往后预取，免得变成一路扫下去。
+    prefetch: bool,
 }
 
 pub struct Thumbs {
@@ -93,6 +102,7 @@ impl Thumbs {
             path: path.to_path_buf(),
             key: (path.to_string_lossy().into_owned(), bucket),
             at,
+            prefetch: false,
         });
     }
 
@@ -142,6 +152,11 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
     let mut queue: VecDeque<Job> = VecDeque::new();
     let mut loaded: Option<String> = None;
     let mut size: (u32, u32) = (0, 0);
+    // 当前这条片子的时长（预取时要拿它判断有没有越过片尾）
+    let mut dur: f64 = 0.0;
+    // 刚服务完的那一格（路径, 桶）。队列空的时候顺着它预取下一格 ——
+    // 用户往往是往右扫的，先备好下一张，扫起来才不一顿一顿。
+    let mut last: Option<(PathBuf, i64, f64)> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -164,9 +179,25 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
         }
 
         let Some(job) = queue.pop_front() else {
-            std::thread::sleep(Duration::from_millis(80));
+            // 队列空了：顺手把刚才那一格的下一格预取出来（只预取一格，
+            // 预取出来的不再继续往后预取，否则就变成一路扫到底了）。
+            match last.take() {
+                Some((path, bucket, dur)) if bucket_time(bucket + 1) < dur - 0.5 => {
+                    let next = bucket + 1;
+                    queue.push_back(Job {
+                        key: (path.to_string_lossy().into_owned(), next),
+                        at: bucket_time(next),
+                        path,
+                        prefetch: true,
+                    });
+                }
+                _ => std::thread::sleep(Duration::from_millis(80)),
+            }
             continue;
         };
+        if log_enabled() {
+            eprintln!("thumb job: bucket={} t={:.1} {}", job.key.1, job.at, job.path.display());
+        }
 
         if mpv.is_none() {
             match Mpv::frames() {
@@ -186,9 +217,24 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
         if loaded.as_deref() != Some(path_str.as_str()) {
             loaded = None;
             size = (0, 0);
-            if open(m, &path_str, &stop).is_some() {
+            let opened = open(m, &path_str, &stop);
+            if let Some(d) = opened {
+                dur = d;
                 size = video_size(m);
                 loaded = Some(path_str.clone());
+            }
+            if log_enabled() {
+                eprintln!(
+                    "thumb open: {} dur={:?} 尺寸 {}x{} 像素格式={:?} primaries={:?} gamma={:?} hdr={:?}",
+                    if opened.is_some() { "成功" } else { "失败" },
+                    opened,
+                    size.0,
+                    size.1,
+                    m.get_string("video-params/pixelformat"),
+                    m.get_string("video-params/primaries"),
+                    m.get_string("video-params/gamma"),
+                    m.get_string("video-params/sig-peak"),
+                );
             }
         }
         if loaded.is_none() {
@@ -199,6 +245,11 @@ fn run(rx: Receiver<Job>, tx: Sender<Shot>, stop: Arc<AtomicBool>) {
             && tx.send(shot).is_err()
         {
             return;
+        }
+
+        // 预取出来的那一格不参与「继续往后预取」，否则会一路扫到片尾。
+        if !job.prefetch {
+            last = Some((job.path.clone(), job.key.1, dur));
         }
     }
 }
@@ -240,6 +291,17 @@ fn video_size(m: &Mpv) -> (u32, u32) {
 }
 
 /// seek 到目标位置，等那张图真的画出来，再缩成缩略图。
+///
+/// 这个函数踩过的坑值得写下来，全是「交出一张黑图」的成因：
+///
+/// 1. `time-pos` 设完**立刻**就变成目标值，但画面还得从关键帧一路解过来。
+///    这期间 mpv 会先画一帧纯黑底色。以前看完 `time-pos` 就取帧，于是在长 GOP /
+///    4K 的片子上永远拿到那张黑帧 —— 表现就是「鼠标指哪儿都是黑的」。
+/// 2. `needs_render()` 会把「有新帧」那个**一次性**标志吃掉。暂停状态下 mpv
+///    只会在寻址完成时再发一次；要是在寻址过程中乱读，就把那唯一一次吃掉了，
+///    之后永远等不到 —— 所以「等寻址结束」这一段**一次都不能读**。
+/// 3. 因此寻址结束后不再死等标志：mpv 的渲染本来就是画「当前帧」，寻址完成后
+///    当前帧就是目标帧。等不到标志就定时硬画一帧，比干等靠谱。
 fn grab(m: &Mpv, job: &Job, size: (u32, u32), stop: &AtomicBool) -> Option<Shot> {
     let (vw, vh) = size;
     if vw == 0 || vh == 0 {
@@ -247,43 +309,93 @@ fn grab(m: &Mpv, job: &Job, size: (u32, u32), stop: &AtomicBool) -> Option<Shot>
     }
     let th = thumb_height(vw, vh);
 
-    m.seek_absolute(job.at);
+    // 先清掉上一条命令留下的事件，否则这里会立刻读到**上一次**寻址的
+    // playback-restart，等于没等。
+    let _ = m.pump_events();
 
-    let mut buf: Vec<u8> = Vec::new();
-    let mut scratch: Vec<u8> = Vec::new();
+    m.seek_absolute(job.at);
     let start = Instant::now();
 
-    while start.elapsed() < FRAME_TIMEOUT {
+    // ---- 1. 等寻址结束（全程不碰渲染上下文）----
+    //
+    // 认 `playback-restart` 这条事件，不认 `time-pos`，也不轮询 `needs_render`。
+    // 前者一设就变（画面还没解出来），后者是一次性标志，读了就没了。
+    let done = m.wait_seek_done(FRAME_TIMEOUT);
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    if !done && log_enabled() {
+        eprintln!("thumb 寻址事件没来: t={:.1} 当前位置 {:?}", job.at, m.get_f64("time-pos"));
+    }
+    // 事件没来也往下走：定位也许已经完成、只是事件被前面清掉了，
+    // 后面还有黑帧检测兜底。
+
+    // ---- 2. 把这一帧画出来 ----
+    let mut buf: Vec<u8> = Vec::new();
+    let mut blanks: u32 = 0;
+    loop {
+        if start.elapsed() >= FRAME_TIMEOUT {
+            if log_enabled() {
+                eprintln!("thumb 等画面超时: t={:.1} 黑帧 {}", job.at, blanks);
+            }
+            return None;
+        }
         if stop.load(Ordering::Relaxed) {
             return None;
         }
 
-        if !m.needs_render() {
+        // 有「新帧」标志就等它（省得白画），但最多等 250ms —— 解码慢的时候
+        // 标志可能已经被吃掉了，这时候直接画当前帧照样能拿到目标画面。
+        let waited = Instant::now();
+        while !m.needs_render() && waited.elapsed() < Duration::from_millis(250) {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+
+        if !m.render_into(&mut buf, W, th) {
             std::thread::sleep(Duration::from_millis(4));
             continue;
         }
 
-        let pos = m.get_f64("time-pos").unwrap_or(-1.0);
-        let on_target = (pos - job.at).abs() <= POS_EPS;
-
-        // 不管位置对不对都要把这一帧「消费」掉：渲染上下文的新帧标志是一次性的，
-        // 不读走的话下面永远等不到下一帧。
-        let ok = if on_target {
-            m.render_into(&mut buf, W, th)
-        } else {
-            m.render_into(&mut scratch, W, th)
-        };
-        if !ok {
-            std::thread::sleep(Duration::from_millis(4));
-            continue;
+        if log_enabled() {
+            eprintln!(
+                "  try t={:.1} {}ms pos={:?} idle={:?} vo={:?} 亮度={:.1}",
+                job.at,
+                start.elapsed().as_millis(),
+                m.get_f64("time-pos"),
+                m.get_string("core-idle"),
+                m.get_string("vo-configured"),
+                mean(&buf)
+            );
         }
-        if !on_target {
+
+        if is_blank(&buf) {
+            // 解码器还没交出画面，mpv 画的是底色。再等等，但别无限等：
+            // 真·全黑的画面等多久都是黑的。
+            blanks += 1;
+            if blanks >= BLANK_TRIES {
+                if log_enabled() {
+                    eprintln!("thumb 放弃: t={:.1} 连续 {} 帧纯黑", job.at, blanks);
+                }
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
             continue;
         }
 
         // rgb0 → rgba：mpv 交出来的第 4 个字节是填充位，iced 要的是 alpha
         for px in buf.chunks_exact_mut(4) {
             px[3] = 255;
+        }
+        if log_enabled() {
+            eprintln!(
+                "thumb ok: t={:.1} 用时 {}ms 平均亮度 {:.1}",
+                job.at,
+                start.elapsed().as_millis(),
+                mean(&buf)
+            );
         }
         return Some(Shot {
             key: job.key.clone(),
@@ -292,7 +404,40 @@ fn grab(m: &Mpv, job: &Job, size: (u32, u32), stop: &AtomicBool) -> Option<Shot>
             rgba: buf,
         });
     }
-    None
+}
+
+/// 这张图是不是 mpv「还没画出画面」时的那张空底。
+///
+/// 这里**不能用平均亮度**判断。4K HDR 的片子里，暗场画面经 tonemap 之后
+/// 平均亮度只有 0.5 上下（实测一部 4K HDR 片子 41 秒处 ffmpeg 直解是 13.9/255，
+/// mpv 映射到 SDR 只有 0.6），跟空底几乎分不开 —— 用亮度判会把
+/// 正常的暗场当成空底，用户看到的就是「这段没有预览」。
+///
+/// 空底的特征是**整块全是 0**（mpv 直接清成黑），真正的画面哪怕再暗也会有
+/// 几个非零像素。所以只认「一个亮着的像素都没有」。
+fn is_blank(rgba: &[u8]) -> bool {
+    let lit = rgba
+        .chunks_exact(4)
+        .filter(|p| p[0] > 0 || p[1] > 0 || p[2] > 0)
+        .take(4)
+        .count();
+    lit == 0
+}
+
+/// RGB 三通道的平均值（0~255），只看亮不亮，不管 alpha。
+fn mean(rgba: &[u8]) -> f64 {
+    let px = rgba.chunks_exact(4);
+    let n = px.len().max(1);
+    let sum: u64 = rgba
+        .chunks_exact(4)
+        .map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64)
+        .sum();
+    sum as f64 / (n * 3) as f64
+}
+
+/// `QP_THUMB_LOG=1` 时把抽帧情况打到 stderr，排查「预览是黑的」用。
+fn log_enabled() -> bool {
+    std::env::var_os("QP_THUMB_LOG").is_some()
 }
 
 #[cfg(test)]
@@ -369,5 +514,16 @@ mod tests {
         let b = wait(20).expect("第 20 格抽不出来");
         assert_eq!(b.w, a.w);
         assert_ne!(a.rgba, b.rgba, "两个时间点抽出了一模一样的图，seek 八成没生效");
+
+        // 亮不亮：全黑（或几乎全黑）说明渲染上下文根本没出画面
+        let mean = |s: &Shot| {
+            let n = s.rgba.chunks_exact(4).count().max(1);
+            let sum: u64 = s.rgba.chunks_exact(4).map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64).sum();
+            sum as f64 / (n * 3) as f64
+        };
+        eprintln!("bucket2 mean={:.1} bucket20 mean={:.1}", mean(&a), mean(&b));
+        // 不能拿「亮不亮」当合格线：暗场画面本来就接近黑，但不该是空底
+        assert!(!is_blank(&a.rgba), "第 2 格是空底（mpv 没画出画面）");
+        assert!(!is_blank(&b.rgba), "第 20 格是空底（mpv 没画出画面）");
     }
 }

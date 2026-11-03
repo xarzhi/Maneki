@@ -591,6 +591,9 @@ struct App {
     thumb_last: Option<thumbs::Key>,
     /// 鼠标此刻停在进度条的哪个位置
     bar_hover: Option<BarHover>,
+    /// 已经在排队等的那一格。tick 是 60Hz，不挡一下的话同一格会一秒发 60 条请求，
+    /// 线程那边刚 seek 完又被灌满，永远在重复同一件事。
+    thumb_asked: Option<thumbs::Key>,
 }
 
 /// 一张缩略图：除了 iced 的贴图句柄，还记着像素尺寸（摆浮层要算居中）
@@ -736,6 +739,7 @@ impl App {
             thumb_order: std::collections::VecDeque::new(),
             thumb_last: None,
             bar_hover: None,
+            thumb_asked: None,
         };
 
         if let Some(p) = &app.player {
@@ -1494,10 +1498,12 @@ impl App {
             return;
         }
 
-        // 停够了才去抽
+        // 停够了才去抽；同一格只发一次，别每帧都塞一遍
         if hover.since.elapsed() >= Self::THUMB_DWELL
+            && self.thumb_asked.as_ref() != Some(&key)
             && let Some(t) = &self.thumbs
         {
+            self.thumb_asked = Some(key);
             t.want(&path, hover.bucket);
         }
     }
@@ -2522,6 +2528,9 @@ impl App {
             // 见 `animate`：手扫过进度条的时候不该一直解码。
             Message::BarHover(p) => {
                 self.bar_hover = self.bar_hover_at(p);
+                if std::env::var_os("QP_THUMB_LOG").is_some() {
+                    eprintln!("bar hover: p={p:?} -> {:?}", self.bar_hover.map(|h| h.bucket));
+                }
             }
             Message::BarLeave => self.bar_hover = None,
 
