@@ -32,6 +32,7 @@ pub enum Tab {
     #[default]
     Picture,
     Color,
+    About,
 }
 
 impl Tab {
@@ -39,10 +40,11 @@ impl Tab {
         match self {
             Tab::Picture => "画面",
             Tab::Color => "色彩",
+            Tab::About => "关于",
         }
     }
 
-    const ALL: [Tab; 2] = [Tab::Picture, Tab::Color];
+    const ALL: [Tab; 3] = [Tab::Picture, Tab::Color, Tab::About];
 }
 
 /// 色彩调整里能被点的那几项
@@ -129,6 +131,7 @@ pub fn drawer<'a>(s: &'a Settings) -> Element<'a, Message> {
     let content: Element<'a, Message> = match s.tab {
         Tab::Picture => picture_tab(s),
         Tab::Color => color_tab(s),
+        Tab::About => about_tab(),
     };
 
     let body = container(content)
@@ -136,7 +139,7 @@ pub fn drawer<'a>(s: &'a Settings) -> Element<'a, Message> {
         .padding(Padding {
             top: 12.0,
             right: PAD,
-            bottom: 16.0,
+            bottom: 12.0,
             left: PAD,
         });
 
@@ -359,6 +362,170 @@ fn look_row(
     .spacing(10)
     .align_y(Alignment::Center)
     .height(Length::Fixed(32.0))
+    .into()
+}
+
+// ---------------- 关于 ----------------
+
+/// 「关于」页：技术栈、能解什么、开源地址。
+///
+/// 内容都是编译期常量（`env!("CARGO_PKG_VERSION")` + 硬编码的清单），
+/// 不读运行时状态，所以不接收 `&Settings`，换页也不会有任何开销。
+fn about_tab() -> Element<'static, Message> {
+    let version = env!("CARGO_PKG_VERSION");
+
+    let head = column![
+        row![
+            text("Maneki")
+                .font(icon::UI_FONT)
+                .size(19)
+                .color(icon::TEXT),
+            text(format!("{version}"))
+                .font(icon::UI_FONT)
+                .size(12)
+                .color(icon::TEXT_FAINT),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        gap(4.0),
+        text("极速打开、全格式解码的 Windows 视频播放器")
+            .font(icon::UI_FONT)
+            .size(12.5)
+            .color(icon::TEXT_DIM)
+            .width(Fill),
+    ]
+    .spacing(2)
+    .width(Fill);
+
+    let tech = column![
+        info_row("开发语言", "Rust（edition 2024）"),
+        info_row("界面框架", "iced 0.14"),
+        info_row("解码内核", "libmpv · FFmpeg（硬解优先）"),
+        info_row("音频输出", "rodio · WASAPI"),
+    ]
+    .spacing(5)
+    .width(Fill);
+
+    let formats = column![
+        field_label("容器"),
+        text("MP4 · MKV · AVI · MOV · FLV · WMV · WebM · TS · M2TS · VOB · RMVB · OGV · 3GP · MXF …")
+            .font(icon::UI_FONT)
+            .size(12.5)
+            .color(icon::TEXT_DIM)
+            .width(Fill),
+        gap(6.0),
+        field_label("编码"),
+        text("H.264 · H.265 · AV1 · VP9 · MPEG-1/2/4 · VC-1 · WMV · Theora · RealVideo · ProRes · FFV1 …")
+            .font(icon::UI_FONT)
+            .size(12.5)
+            .color(icon::TEXT_DIM)
+            .width(Fill),
+    ]
+    .spacing(2)
+    .width(Fill);
+
+    // 网址本身就是按钮的文字：抽屉只有 344 宽，再单起一行放 URL 就得滚动才能看全
+    let repo = link_button(crate::REPO_URL, Message::OpenRepo);
+
+    // 这句话一行放不下（正文满行也就 296 左右）。交给自动换行的话，断点会落在
+    // 「……版权归各自作者 / 所有。」—— 末行只剩三个字，贴着底边看着像被裁掉了。
+    // 顺手在逗号后面手动分行，两行长度差不多，也读得顺。
+    let credit = column![
+        text("MIT 许可证 · 解码由 libmpv / FFmpeg 完成，")
+            .font(icon::UI_FONT)
+            .size(11.5)
+            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.42))
+            .width(Fill),
+        text("版权归各自作者所有。")
+            .font(icon::UI_FONT)
+            .size(11.5)
+            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.42))
+            .width(Fill),
+    ]
+    .spacing(1)
+    .width(Fill);
+
+    let col = column![
+        head,
+        gap(12.0),
+        section("技术栈"),
+        tech,
+        gap(12.0),
+        section("支持的视频"),
+        formats,
+        gap(12.0),
+        section("开源"),
+        repo,
+        gap(10.0),
+        credit,
+    ]
+    .spacing(6)
+    .width(Fill);
+
+    container(col).width(Fill).into()
+}
+
+/// 「标签 — 值」一行（左侧标签定宽，值占满剩下的宽度，长了会自动换行）
+fn info_row(label: &'static str, value: &'static str) -> Element<'static, Message> {
+    row![
+        text(label)
+            .font(icon::UI_FONT)
+            .size(13)
+            .color(icon::TEXT_FAINT)
+            .width(Length::Fixed(64.0)),
+        text(value)
+            .font(icon::UI_FONT)
+            .size(13)
+            .color(icon::TEXT)
+            .width(Fill),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Start)
+    .width(Fill)
+    .into()
+}
+
+fn field_label(label: &'static str) -> Element<'static, Message> {
+    text(label)
+        .font(icon::UI_FONT)
+        .size(12)
+        .color(icon::TEXT_FAINT)
+        .into()
+}
+
+/// 强调色文字按钮（当链接用）
+fn link_button(label: &'static str, msg: Message) -> Element<'static, Message> {
+    button(
+        text(label)
+            .font(icon::UI_FONT)
+            .size(13)
+            .color(icon::ACCENT),
+    )
+    .padding(Padding {
+        top: 7.0,
+        right: 12.0,
+        bottom: 7.0,
+        left: 12.0,
+    })
+    .on_press(msg)
+    .style(|_t, status| {
+        use button::Status;
+        let bg = match status {
+            Status::Hovered => Color::from_rgba(0.36, 0.72, 0.98, 0.16),
+            Status::Pressed => Color::from_rgba(0.36, 0.72, 0.98, 0.24),
+            _ => Color::from_rgba(0.36, 0.72, 0.98, 0.08),
+        };
+        button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: icon::ACCENT,
+            border: Border {
+                radius: 7.0.into(),
+                width: 1.0,
+                color: Color::from_rgba(0.36, 0.72, 0.98, 0.35),
+            },
+            ..button::Style::default()
+        }
+    })
     .into()
 }
 

@@ -427,3 +427,24 @@ pub fn open_default_apps() {
         );
     }
 }
+
+/// 用系统默认浏览器打开一个 http(s) 链接（「关于」页里的开源地址用）。
+///
+/// 交给 `ShellExecuteW` 而不是 `cmd /c start`：后者要过一遍命令行解析，
+/// URL 里的 `&`、`?` 会被当成命令分隔符，还得自己加引号绕。
+/// ShellExecuteW 直接把字符串交给 shell 的 URL 处理器，不经过 shell 解释。
+pub fn open_url(url: &str) {
+    let op = wide("open");
+    let target = wide(url);
+    const SW_SHOWNORMAL: i32 = 1;
+    unsafe {
+        ShellExecuteW(
+            0,
+            op.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}

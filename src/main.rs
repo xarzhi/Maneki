@@ -62,6 +62,9 @@ const AUDIO_PULSE: f32 = 4.2;
 const AUDIO_BG: Color = Color::from_rgb(0.043, 0.047, 0.055);
 /// 收起/展开的过渡时间常数（约 0.09s 走完 63%，体感 250ms 左右）
 const ANIM_TAU: f32 = 0.09;
+
+/// 开源地址。「关于」页里显示这一行，点它用系统浏览器打开。
+pub const REPO_URL: &str = "https://github.com/xarzhi/Maneki";
 /// 换片后等这么久还没出画面，才把转圈画出来。
 ///
 /// 本地小文件常常 50~80ms 就出首帧了，门一开到就画圈会在每次切集时闪一下，
@@ -274,6 +277,8 @@ enum Message {
     ResetLook,
     /// 设置里的「自动连播」勾选
     SetAutoplay(bool),
+    /// 「关于」页里点开源地址：用系统浏览器打开
+    OpenRepo,
 
     // ---- 字幕 popover ----
     /// 点底栏的字幕键：展开 / 收起字幕 popover
@@ -542,6 +547,11 @@ impl App {
                 app.playlist.open = false;
                 app.settings.open = true;
                 app.settings.tab = Tab::Color;
+            }
+            Ok("about") => {
+                app.playlist.open = false;
+                app.settings.open = true;
+                app.settings.tab = Tab::About;
             }
             Ok("subtitle") => {
                 app.playlist.open = false;
@@ -1702,6 +1712,10 @@ impl App {
             }
             Message::SetAutoplay(on) => {
                 self.settings.autoplay = on;
+            }
+            Message::OpenRepo => {
+                self.touch();
+                assoc::open_url(REPO_URL);
             }
             Message::SetFit(fit) => {
                 self.touch();
