@@ -11,18 +11,21 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, row, scrollable, space, text};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, space, text};
 use iced::{
     Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Vector,
     alignment::{Horizontal, Vertical},
 };
 
+use crate::Message;
 use crate::icon;
 use crate::ui::{elide, fmt_dur};
-use crate::Message;
 
-/// 抽屉宽度（逻辑像素）。比原来宽了 14px：行尾要放时长，名字还得留够地方。
-pub const W: f32 = 316.0;
+/// 抽屉宽度（逻辑像素）。比原来宽了 58px：行尾要放时长，名字还得留够地方。
+///
+/// 316 的时候超出 20 个字的文件名（「[字幕组] 剧名 第01集 [1080p].mkv」这种）
+/// 几乎全被省略号吃掉，看不出是哪一集；360 之后能多留四个字左右。
+pub const W: f32 = 360.0;
 /// 一行的高度。原来是 34，两行字（14 + 12）挤在里面既放不下也没法居中，
 /// 提到 40 之后 `align_y(Center)` 才有余量把内容真正摆在中间。
 const ROW_H: f32 = 40.0;
@@ -35,7 +38,9 @@ const ROW_H: f32 = 40.0;
 /// 左内边距再收到 6：10 的时候竖条离面板边缘还有一段空当，配合行高看左边
 /// 一片虚位。抽屉头那行文件夹名也用这个值（见 `panel()`），两者才对得上。
 const ROW_PAD_L: f32 = 6.0;
-const ROW_PAD_R: f32 = 10.0;
+/// 右内边距比左边大得多：行尾那格是**右对齐**的时长，10px 时数字几乎贴着面板边，
+/// 和上下的标题 / 底栏按钮看着不是一个呼吸；16 才和抽屉左侧的 16 对得上。
+const ROW_PAD_R: f32 = 16.0;
 /// 序号那一格的宽度（两位数也要对得上）
 ///
 /// 原来 18 且**右对齐**：个位数被推到格子右边，竖条和数字之间空出一截 15px 的
@@ -221,6 +226,11 @@ pub struct Playlist {
     pub title: String,
     /// 空列表时的解释（比如「这个文件夹里没有视频或音频」）
     pub note: Option<String>,
+    /// 鼠标正停在第几条上。
+    ///
+    /// iced 的 `button` 样式回调只能改底色，改不了内容；「悬停时把时长换成文件夹
+    /// 按钮」只能由我们自己记住停在哪一行，再按它决定画哪一版行尾。
+    pub hover: Option<usize>,
 }
 
 impl Playlist {
@@ -255,7 +265,10 @@ impl Playlist {
 
         self.title = {
             let count = items.len();
-            match source.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()) {
+            match source
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+            {
                 Some(dir) => format!("{dir} · {count} 项"),
                 None if count == 1 => String::from("1 项"),
                 None => format!("{count} 项"),
@@ -264,6 +277,7 @@ impl Playlist {
         self.items = items;
         self.select = None;
         self.note = None;
+        self.hover = None;
     }
 
     /// 列表清空（也把抽屉关掉）
@@ -273,6 +287,7 @@ impl Playlist {
         self.title.clear();
         self.note = None;
         self.open = false;
+        self.hover = None;
     }
 
     pub fn index_of(&self, path: &Path) -> Option<usize> {
@@ -343,7 +358,8 @@ pub fn panel<'a>(p: &'a Playlist) -> Element<'a, Message> {
         let count = p.items.len();
         let mut list = column![].spacing(1).width(Fill);
         for (i, item) in p.items.iter().enumerate() {
-            list = list.push(item_row(i, item, p.select == Some(i)));
+            let hovered = p.hover == Some(i);
+            list = list.push(item_row(i, item, p.select == Some(i), hovered));
         }
 
         container(
@@ -386,42 +402,43 @@ pub fn panel<'a>(p: &'a Playlist) -> Element<'a, Message> {
     };
 
     // 整块面板包一层 button：点面板的空白处 / 滚动条不该穿透到画面
-    button(
-        column![header, rule(), content]
-            .width(Fill)
-            .height(Fill),
-    )
-    .width(Length::Fixed(W))
-    .height(Fill)
-    .padding(0)
-    .on_press(Message::Noop)
-    .style(|_t, _s| button::Style {
-        // 黑色半透明（见 icon::PANEL_BG）：留一点透光，底下画面动的时候能感觉到
-        background: Some(Background::Color(icon::PANEL_BG)),
-        border: Border {
-            // 只圆左边两个角：这条抽屉贴在窗口右边缘，右边是齐的
-            radius: iced::border::Radius {
-                top_left: 12.0,
-                top_right: 0.0,
-                bottom_right: 0.0,
-                bottom_left: 12.0,
+    button(column![header, rule(), content].width(Fill).height(Fill))
+        .width(Length::Fixed(W))
+        .height(Fill)
+        .padding(0)
+        .on_press(Message::Noop)
+        .style(|_t, _s| button::Style {
+            // 黑色半透明（见 icon::PANEL_BG）：留一点透光，底下画面动的时候能感觉到
+            background: Some(Background::Color(icon::PANEL_BG)),
+            border: Border {
+                // 只圆左边两个角：这条抽屉贴在窗口右边缘，右边是齐的
+                radius: iced::border::Radius {
+                    top_left: 12.0,
+                    top_right: 0.0,
+                    bottom_right: 0.0,
+                    bottom_left: 12.0,
+                },
+                width: 0.0,
+                color: Color::TRANSPARENT,
             },
-            width: 0.0,
-            color: Color::TRANSPARENT,
-        },
-        // 往左的投影要收着点：之前 -8 / blur 26，左边缘外会拖出 30 多像素的暗带，
-        // 看着像面板旁边糊了一块灰。现在 -3 / 18，只在紧贴边缘处留一圈过渡。
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.40),
-            offset: Vector::new(-3.0, 0.0),
-            blur_radius: 18.0,
-        },
-        ..button::Style::default()
-    })
-    .into()
+            // 往左的投影要收着点：之前 -8 / blur 26，左边缘外会拖出 30 多像素的暗带，
+            // 看着像面板旁边糊了一块灰。现在 -3 / 18，只在紧贴边缘处留一圈过渡。
+            shadow: Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.40),
+                offset: Vector::new(-3.0, 0.0),
+                blur_radius: 18.0,
+            },
+            ..button::Style::default()
+        })
+        .into()
 }
 
-fn item_row<'a>(index: usize, item: &'a Item, playing: bool) -> Element<'a, Message> {
+fn item_row<'a>(
+    index: usize,
+    item: &'a Item,
+    playing: bool,
+    hovered: bool,
+) -> Element<'a, Message> {
     // 正在播的那条：左边一条竖杠 + 更亮的字 + 淡淡的蓝底
     let marker = container(space())
         .width(Length::Fixed(3.0))
@@ -484,53 +501,107 @@ fn item_row<'a>(index: usize, item: &'a Item, playing: bool) -> Element<'a, Mess
         );
     }
 
-    let dur = container(
-        text(fmt_dur(item.duration))
-            .font(icon::UI_FONT)
-            .size(13)
-            .color(if playing {
-                icon::TEXT_DIM
-            } else {
-                icon::TEXT_FAINT
-            }),
-    )
-    .width(Length::Fixed(DUR_W))
-    .align_x(Horizontal::Right);
-
-    button(
-        // 内容整体在 40px 的行高里**垂直居中**：容器自己不带 align_y 时内容会贴顶，
-        // 之前文字偏上就是这个原因。
+    // 行尾：平时是时长，鼠标停在这一行就换成一颗文件夹按钮 ——
+    // 点它直接把这个文件在资源管理器里定位出来。两个都占 `DUR_W` 宽，
+    // 悬停时后面的文字不会左右跳一下。
+    let tail: Element<'a, Message> = if hovered {
+        reveal_button(index)
+    } else {
         container(
-            row![head, container(lines).width(Fill), dur]
-                .spacing(ROW_GAP)
-                .align_y(Alignment::Center),
+            text(fmt_dur(item.duration))
+                .font(icon::UI_FONT)
+                .size(13)
+                .color(if playing {
+                    icon::TEXT_DIM
+                } else {
+                    icon::TEXT_FAINT
+                }),
+        )
+        .width(Length::Fixed(DUR_W))
+        .align_x(Horizontal::Right)
+        .into()
+    };
+
+    // 悬停跟踪用 `mouse_area` 包一层：enter / exit 各发一条带下标的消息，
+    // 「移开」那条只在「当前悬停的还是我」时才清（见 main 里的处理）——
+    // 否则从下一行往上移到上一行时，晚到的那条 exit 会把新状态擦掉。
+    mouse_area(
+        button(
+            // 内容整体在 40px 的行高里**垂直居中**：容器自己不带 align_y 时内容会贴顶，
+            // 之前文字偏上就是这个原因。
+            container(
+                row![head, container(lines).width(Fill), tail]
+                    .spacing(ROW_GAP)
+                    .align_y(Alignment::Center),
+            )
+            .width(Fill)
+            .height(Length::Fixed(ROW_H))
+            .padding(Padding {
+                top: 0.0,
+                right: ROW_PAD_R,
+                bottom: 0.0,
+                left: ROW_PAD_L,
+            })
+            .align_y(Vertical::Center),
         )
         .width(Fill)
-        .height(Length::Fixed(ROW_H))
-        .padding(Padding {
-            top: 0.0,
-            right: ROW_PAD_R,
-            bottom: 0.0,
-            left: ROW_PAD_L,
-        })
+        .padding(0)
+        .on_press(Message::PlayIndex(index))
+        .style(move |_t, status| {
+            use button::Status;
+            let bg = match status {
+                _ if playing => Some(Background::Color(Color::from_rgba(0.36, 0.72, 0.98, 0.18))),
+                Status::Hovered => Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.07))),
+                Status::Pressed => Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.12))),
+                _ => None,
+            };
+            button::Style {
+                background: bg,
+                text_color: icon::TEXT,
+                border: Border {
+                    radius: 7.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            }
+        }),
+    )
+    .on_enter(Message::ItemHover(index))
+    .on_exit(Message::ItemUnhover(index))
+    .into()
+}
+
+/// 行尾那颗「在资源管理器里打开」的按钮。
+///
+/// 它嵌在整行的 button 里面：iced 的 button 先把事件交给子控件，子控件吃掉了
+/// 就不再往下走 —— 所以点这颗图标只会开资源管理器，不会顺带播这一条。
+fn reveal_button<'a>(index: usize) -> Element<'a, Message> {
+    button(
+        container(
+            text(icon::FOLDER)
+                .font(icon::ICON_FONT)
+                .size(14.0)
+                .color(icon::TEXT_DIM),
+        )
+        .width(Length::Fixed(DUR_W))
+        .height(Length::Fixed(24.0))
+        .align_x(Horizontal::Center)
         .align_y(Vertical::Center),
     )
-    .width(Fill)
     .padding(0)
-    .on_press(Message::PlayIndex(index))
-    .style(move |_t, status| {
+    .on_press(Message::RevealItem(index))
+    .style(|_t, status| {
         use button::Status;
         let bg = match status {
-            _ if playing => Some(Background::Color(Color::from_rgba(0.36, 0.72, 0.98, 0.18))),
-            Status::Hovered => Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.07))),
-            Status::Pressed => Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.12))),
+            Status::Hovered => Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.14))),
+            Status::Pressed => Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.20))),
             _ => None,
         };
         button::Style {
             background: bg,
             text_color: icon::TEXT,
             border: Border {
-                radius: 7.0.into(),
+                radius: 6.0.into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -603,7 +674,6 @@ fn footer<'a>(count: usize, known: Option<f64>) -> Element<'a, Message> {
 
 // ---------------- 小工具 ----------------
 
-
 fn rule<'a>() -> Element<'a, Message> {
     container(space())
         .width(Fill)
@@ -651,13 +721,22 @@ fn text_button<'a>(label: &'a str, msg: Message, enabled: bool) -> Element<'a, M
         }
     });
 
-    if enabled { b.on_press(msg).into() } else { b.into() }
+    if enabled {
+        b.on_press(msg).into()
+    } else {
+        b.into()
+    }
 }
 
 fn icon_only<'a>(glyph: char, size: f32, msg: Message) -> Element<'a, Message> {
     button(
-        container(text(glyph).font(icon::ICON_FONT).size(size).color(icon::TEXT_FAINT))
-            .center(Length::Fixed(24.0)),
+        container(
+            text(glyph)
+                .font(icon::ICON_FONT)
+                .size(size)
+                .color(icon::TEXT_FAINT),
+        )
+        .center(Length::Fixed(24.0)),
     )
     .padding(0)
     .on_press(msg)
@@ -753,7 +832,10 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["a.mp3", "b.mp4", "d.flac"]);
-        assert_eq!(scan.ignored, 0, "拖的是文件夹，里面的非媒体文件不该算「拖错了」");
+        assert_eq!(
+            scan.ignored, 0,
+            "拖的是文件夹，里面的非媒体文件不该算「拖错了」"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

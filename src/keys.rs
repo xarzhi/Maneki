@@ -58,7 +58,7 @@ pub const GROUPS: &[(&str, &[Shortcut])] = &[
         &[
             Shortcut {
                 keys: "左 / 右",
-                what: "快退 / 快进 5 秒",
+                what: "快退 / 快进 {seek} 秒",
             },
             Shortcut {
                 keys: "J / L",
@@ -89,12 +89,19 @@ pub const GROUPS: &[(&str, &[Shortcut])] = &[
     ),
 ];
 
-/// 快退 / 快进一次的秒数（← / →）
+/// 快退 / 快进一次的**默认**秒数（← / →）。
+///
+/// 真正的步长是设置 → 通用里选的那个（`Settings::seek_step`，默认就是这个值），
+/// 这里只作为出厂值和 `state.rs` 的兜底。
 pub const SEEK_STEP: f64 = 5.0;
 /// J / L 跳的秒数。比方向键大一点，长片子里翻得动。
 pub const JUMP_STEP: f64 = 10.0;
 
 /// 把一个按键翻译成要发的消息。`None` = 这个键我们不管，交给别人。
+///
+/// ← / → 发的是 `NudgeArrow(方向)` 而不是具体秒数：步长在设置里可改（3/5/10/20/30），
+/// 而这里是个纯函数、拿不到设置 —— 具体跳多少由 `main.rs` 按当前设置算。
+/// J / L 是固定的 `JUMP_STEP`，直接带数值走。
 pub fn bind(key: &Key, modifiers: Modifiers, repeat: bool) -> Option<Message> {
     let ctrl = modifiers.control();
 
@@ -113,8 +120,8 @@ pub fn bind(key: &Key, modifiers: Modifiers, repeat: bool) -> Option<Message> {
         //
         // 这几条**故意**连 repeat 一起收：按住 ← 应该一路快退，
         // 按住 ↑ 应该匀速升音量。进度那边有节流（见 `nudge`），不会把请求堆满。
-        Key::Named(Named::ArrowRight) => return Some(Message::Nudge(SEEK_STEP)),
-        Key::Named(Named::ArrowLeft) => return Some(Message::Nudge(-SEEK_STEP)),
+        Key::Named(Named::ArrowRight) => return Some(Message::NudgeArrow(1)),
+        Key::Named(Named::ArrowLeft) => return Some(Message::NudgeArrow(-1)),
         Key::Named(Named::ArrowUp) => return Some(Message::NudgeVolume(crate::VOL_STEP)),
         Key::Named(Named::ArrowDown) => {
             return Some(Message::NudgeVolume(-crate::VOL_STEP));
@@ -215,13 +222,28 @@ mod tests {
             Some(Message::Next)
         ));
         // matches! 的模式里放不了常量表达式，只能取出来比
-        match bind(&Key::Named(Named::ArrowLeft), plain(), false) {
-            Some(Message::Nudge(d)) => assert_eq!(d, -SEEK_STEP),
-            other => panic!("← 应该是快退，拿到 {other:?}"),
+        assert!(matches!(
+            bind(&Key::Named(Named::ArrowLeft), plain(), false),
+            Some(Message::NudgeArrow(-1))
+        ));
+        assert!(matches!(
+            bind(&Key::Named(Named::ArrowRight), plain(), true),
+            Some(Message::NudgeArrow(1))
+        ));
+        // 具体跳几秒由设置决定，键位表这边只给方向
+        assert!(SEEK_STEP > 0.0);
+    }
+
+    /// J / L 是固定的 10 秒，不受「跳转步长」设置影响
+    #[test]
+    fn jump_keys_carry_their_own_step() {
+        match bind(&ch("l"), plain(), false) {
+            Some(Message::Nudge(d)) => assert_eq!(d, JUMP_STEP),
+            other => panic!("L 应该快进 {JUMP_STEP} 秒，拿到 {other:?}"),
         }
-        match bind(&Key::Named(Named::ArrowRight), plain(), true) {
-            Some(Message::Nudge(d)) => assert_eq!(d, SEEK_STEP),
-            other => panic!("→ 应该是快进，拿到 {other:?}"),
+        match bind(&ch("j"), plain(), false) {
+            Some(Message::Nudge(d)) => assert_eq!(d, -JUMP_STEP),
+            other => panic!("J 应该快退 {JUMP_STEP} 秒，拿到 {other:?}"),
         }
     }
 

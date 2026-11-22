@@ -26,12 +26,12 @@ mod win32;
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    button, column, container, mouse_area, row, slider, space, stack, text, vertical_slider, Float,
+    Float, button, column, container, mouse_area, row, slider, space, stack, text, vertical_slider,
 };
 use iced::window::Direction;
 use iced::{
-    mouse, Alignment, Background, Border, Color, Element, Fill, Length, Padding, Point,
-    Rectangle, Shadow, Size, Subscription, Task, Theme, Vector,
+    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Point, Rectangle, Shadow,
+    Size, Subscription, Task, Theme, Vector, mouse,
 };
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -231,6 +231,14 @@ fn main() -> iced::Result {
             report(assoc::register(), "已注册为视频 / 音频文件的打开方式。");
             return Ok(());
         }
+        // 和设置里那颗「一键关联全部格式」是同一件事，方便脚本里直接调
+        Some("--associate") => {
+            report(
+                assoc::associate_all().map(|_| ()),
+                "已把所有支持的格式关联到 Maneki。",
+            );
+            return Ok(());
+        }
         Some("--unregister") => {
             report(assoc::unregister(), "已取消注册。");
             return Ok(());
@@ -270,12 +278,8 @@ fn main() -> iced::Result {
             position: iced::window::Position::Centered,
             decorations: false,
             // 任务栏 / Alt-Tab 的图标
-            icon: iced::window::icon::from_rgba(
-                LOGO_BIG_RGBA.to_vec(),
-                LOGO_BIG_SRC,
-                LOGO_BIG_SRC,
-            )
-            .ok(),
+            icon: iced::window::icon::from_rgba(LOGO_BIG_RGBA.to_vec(), LOGO_BIG_SRC, LOGO_BIG_SRC)
+                .ok(),
             ..Default::default()
         })
         .antialiasing(true)
@@ -310,6 +314,8 @@ enum Message {
     Seek(f64),
     /// 方向键 ← / →：快退 / 快进，正数前进
     Nudge(f64),
+    /// ← / → 本身只报方向，跳多少秒由设置里的「跳转步长」决定
+    NudgeArrow(i8),
     /// 方向键 ↑ / ↓：调音量，正数增大（0~100 的刻度）
     NudgeVolume(f64),
     Volume(f64),
@@ -373,6 +379,12 @@ enum Message {
     ResetLook,
     /// 设置里的「自动连播」勾选
     SetAutoplay(bool),
+    /// 设置里的「记录最近播放」勾选（关掉会清空已有记录）
+    SetRecent(bool),
+    /// 设置 → 通用：← / → 一次跳多少秒
+    SetSeekStep(f64),
+    /// 设置 → 通用：一键把所有格式都关联到本程序
+    AssociateAll,
     /// 「关于」页里点开源地址：用系统浏览器打开
     OpenRepo,
 
@@ -394,6 +406,13 @@ enum Message {
     ClearPlaylist,
     /// 选一个文件夹，把里面的视频和音频全部装进列表
     PickFolder,
+    /// 鼠标停在列表第几条上（None 的那一半见 `ItemUnhover`）
+    ItemHover(usize),
+    /// 鼠标离开第几条。带下标是为了只清自己那一条 —— 从下一行移回上一行时，
+    /// 两条消息的顺序可能是「进入新的」在前、「离开旧的」在后，不带下标就擦错了。
+    ItemUnhover(usize),
+    /// 点行尾那颗文件夹：在资源管理器里定位这一条的文件
+    RevealItem(usize),
 
     // ---- 播放速度 ----
     /// 点左下角的速度键：展开 / 收起速度 popover
@@ -412,6 +431,8 @@ enum Message {
 
     /// 什么都不做。用来「吃掉」事件 —— 比如抽屉上那层 button、cover 上的右键。
     Noop,
+    /// 点在顶栏 / 底栏的**空白处**：把所有抽屉收起来（和点画面一个效果）。
+    BarPress,
 }
 
 struct App {
@@ -518,6 +539,11 @@ struct App {
     topmost: bool,
     /// 设置抽屉的状态（填充 / 比例 / 色彩 / 自动连播 / 当前标签页）
     settings: Settings,
+    /// 文件关联的现状（设置 → 通用里那行「已关联 x / y」）。
+    ///
+    /// 缓存着，不每次绘制都去读注册表：38 个后缀 × 2 个键，60Hz 下就是每秒
+    /// 两千多次系统调用。只在启动、打开设置、点完「一键关联」时刷新。
+    assoc_report: assoc::Report,
     /// 设置抽屉的滑入滑出进度（1 = 完全展开，0 = 完全收在右边外面）
     settings_anim: f32,
     /// 播放列表抽屉的滑入滑出进度
@@ -709,7 +735,10 @@ impl App {
                 aspect: state.aspect,
                 look: state.look,
                 autoplay: state.autoplay,
+                seek_step: state.seek_step,
+                recent: state.recent_enabled,
             },
+            assoc_report: assoc::status(),
             settings_anim: 0.0,
             playlist_anim: 0.0,
             stage_press: false,
@@ -763,6 +792,11 @@ impl App {
                 app.playlist.open = false;
                 app.settings.open = true;
             }
+            Ok("general") => {
+                app.playlist.open = false;
+                app.settings.open = true;
+                app.settings.tab = Tab::General;
+            }
             Ok("color") => {
                 app.playlist.open = false;
                 app.settings.open = true;
@@ -814,7 +848,8 @@ impl App {
         if let Some(prev) = self.current.clone()
             && self.duration > 0.0
         {
-            self.state.note_position(&prev, self.position, self.duration);
+            self.state
+                .note_position(&prev, self.position, self.duration);
             self.state_dirty = true;
         }
 
@@ -1179,6 +1214,18 @@ impl App {
             || self.info_anim > 0.002
     }
 
+    /// 收起所有右侧抽屉。
+    ///
+    /// 点画面、点顶栏 / 底栏的空白处、点进度条、按 Esc 都该关抽屉 —— 以前只有画面
+    /// 和底栏之间那层透明 cover 会关，而 cover 是压在顶底栏**下面**的（不这样
+    /// 播放控制点了没反应），于是点顶栏、点底栏都像是「点了没反应」。
+    fn dismiss_drawers(&mut self) {
+        self.playlist.open = false;
+        self.playlist.hover = None;
+        self.settings.close();
+        self.info_open = false;
+    }
+
     /// 按**名义上的** 16ms 推一帧。只有单测走这条路 —— 它们不关心真实时间，
     /// 要的是「第 N 帧状态可复现」。运行时走 `animate_with`，用真实帧间隔。
     #[cfg(test)]
@@ -1238,7 +1285,8 @@ impl App {
         // 手动滚过去看后面的词：每帧把画面**钉住**（播放继续往前唱，视图不动），
         // 四秒不再滚就滑回正在唱的那一句。
         if let Some(pin) = self.lyric_pin {
-            self.lyric_browse.set_target(pin - self.lyric_scroll.value());
+            self.lyric_browse
+                .set_target(pin - self.lyric_scroll.value());
         }
         if self
             .lyric_browse_at
@@ -1288,7 +1336,10 @@ impl App {
         } else {
             SPIN_DELAY
         };
-        let waited = now.saturating_duration_since(since).saturating_sub(delay).as_secs_f32();
+        let waited = now
+            .saturating_duration_since(since)
+            .saturating_sub(delay)
+            .as_secs_f32();
         (waited / SPIN_FADE).min(1.0)
     }
 
@@ -1342,9 +1393,12 @@ impl App {
             self.tags = tags;
             // 新歌词就从当前播放位置重新对一次行，不然要等下一次 tick 才亮。
             // 位置也直接定位过去：不然第一句会从顶上滑下来，像放错了歌。
-            self.lyric_line = self.tags.lyrics.as_ref().and_then(|l| l.index_at(self.position));
-            self.lyric_scroll
-                .snap(self.lyric_line.unwrap_or(0) as f32);
+            self.lyric_line = self
+                .tags
+                .lyrics
+                .as_ref()
+                .and_then(|l| l.index_at(self.position));
+            self.lyric_scroll.snap(self.lyric_line.unwrap_or(0) as f32);
         }
     }
 
@@ -1457,10 +1511,11 @@ impl App {
     fn thumb_for(&self, bucket: i64) -> Option<(&iced::widget::image::Handle, f32, f32)> {
         let path = self.current.as_ref()?.to_string_lossy().into_owned();
         let key = (path, bucket);
-        let hit = self
-            .thumb_cache
-            .get(&key)
-            .or_else(|| self.thumb_last.as_ref().and_then(|k| self.thumb_cache.get(k)))?;
+        let hit = self.thumb_cache.get(&key).or_else(|| {
+            self.thumb_last
+                .as_ref()
+                .and_then(|k| self.thumb_cache.get(k))
+        })?;
         Some((&hit.handle, hit.w, hit.h))
     }
 
@@ -1575,7 +1630,8 @@ impl App {
         Some(
             Float::new(panel)
                 .translate(move |bounds: Rectangle, viewport: Rectangle| {
-                    let x = (anchor - bounds.width / 2.0).clamp(6.0, (win_w - bounds.width - 6.0).max(6.0));
+                    let x = (anchor - bounds.width / 2.0)
+                        .clamp(6.0, (win_w - bounds.width - 6.0).max(6.0));
                     // 底栏顶边再往上一点。底栏自己带阴影，贴太近会糊成一团
                     let y = viewport.height - BOTTOM_H - bounds.height - 10.0;
                     Vector::new(x - bounds.x, y - bounds.y)
@@ -1675,6 +1731,8 @@ impl App {
         self.state.aspect = self.settings.aspect;
         self.state.look = self.settings.look;
         self.state.autoplay = self.settings.autoplay;
+        self.state.seek_step = self.settings.seek_step;
+        self.state.recent_enabled = self.settings.recent;
         self.state_dirty = true;
     }
 
@@ -1697,7 +1755,9 @@ impl App {
         if self.state_note.elapsed() < Duration::from_secs(1) {
             return;
         }
-        let Some(cur) = self.current.clone() else { return };
+        let Some(cur) = self.current.clone() else {
+            return;
+        };
         if self.duration <= 0.0 {
             return;
         }
@@ -1712,7 +1772,9 @@ impl App {
     /// 为什么不在 `play()` 里直接 `Seek`：那一刻 mpv 还没把文件解析完，
     /// 时长是 0，发了也是白发（mpv 会按 0 处理，直接从头开始）。
     fn apply_resume(&mut self) {
-        let Some(at) = self.pending_resume else { return };
+        let Some(at) = self.pending_resume else {
+            return;
+        };
         // 时长还没报上来 / 还没真正放起来，再等等
         if self.duration <= 0.0 || self.loading_since.is_some() {
             return;
@@ -1814,6 +1876,13 @@ impl App {
         self.position = t;
         self.seek_at = Some(Instant::now());
         self.send(Cmd::Seek(t));
+        // 「前进 5 秒」这种短提示：步长是设置里选的，提示里的数字必须跟着变，
+        // 不然用户改完设置会觉得设置没生效。
+        self.toast(if delta >= 0.0 {
+            format!("前进 {} 秒", ui::fmt_secs(delta.abs()))
+        } else {
+            format!("后退 {} 秒", ui::fmt_secs(delta.abs()))
+        });
     }
 
     /// ↑ / ↓ 调音量，一次 `VOL_STEP`，夹在 0~100。
@@ -1838,7 +1907,6 @@ impl App {
         self.flush_drops();
         self.drain_probe();
         self.drain_tags();
-
 
         // 别的实例把路径转交过来了（又双击了一次 exe / 把视频「打开方式」选成本程序）：
         // 走和拖放完全一样的 open_paths，所以「第二次打开」的效果和拖进来一致。
@@ -1934,9 +2002,7 @@ impl App {
                 // 只在 false → true 的那一下触发，之后 eof 一直是 true 也不会重复跳。
                 let just_ended = snap.eof && !self.eof_prev;
                 self.eof_prev = snap.eof;
-                if just_ended
-                    && let Some(cur) = self.current.clone()
-                {
+                if just_ended && let Some(cur) = self.current.clone() {
                     // 已经看完了：把进度记录清掉，下次打开就该从头放，
                     // 而不是「续播」到结尾前 3 秒。
                     self.state.forget_position(&cur);
@@ -2237,7 +2303,11 @@ impl App {
             Message::OpenDialog => {
                 self.touch();
                 // 从当前视频所在目录开始，比每次从「视频」库重新找一遍省事
-                let start = self.current.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf());
+                let start = self
+                    .current
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|d| d.to_path_buf());
                 return Task::perform(
                     async move {
                         let mut dialog = rfd::AsyncFileDialog::new();
@@ -2278,11 +2348,18 @@ impl App {
 
             Message::TogglePlay => self.toggle_play(),
             Message::Nudge(delta) => self.nudge(delta),
+            Message::NudgeArrow(dir) => {
+                let step = self.settings.seek_step;
+                self.nudge(if dir >= 0 { step } else { -step });
+            }
             Message::NudgeVolume(delta) => self.nudge_volume(delta),
             Message::Seek(secs) => {
                 self.position = secs;
                 self.seek_at = Some(Instant::now());
                 self.send(Cmd::Seek(secs));
+                // 拖 / 点进度条是底栏上最大的一块，抽屉开着时这一下也该把它收起来
+                // （滑块自己吃掉了按下事件，底栏那层 `on_press` 收不到）
+                self.dismiss_drawers();
             }
             Message::Volume(vol) => {
                 self.volume = vol;
@@ -2442,6 +2519,9 @@ impl App {
             }
 
             Message::WinDrag => {
+                // 按在顶栏上也算「点到了别处」：抽屉开着时先把抽屉收起来，
+                // 顺手继续当抓手拖窗口（两者不冲突）。
+                self.dismiss_drawers();
                 // 只记起点，剩下的交给 `step_move` 每个 tick 自己挪
                 // （见 `DragMove` 的注释：`window::drag` 会卡住整个 UI 线程）
                 //
@@ -2505,6 +2585,8 @@ impl App {
                 self.cursor = None;
                 // 鼠标出去了，这次按下就不算数了（免得在外面松手又切一次暂停）
                 self.stage_press = false;
+                // 列表的悬停状态也一起清掉：`on_exit` 不一定能在指针离开窗口时送到
+                self.playlist.hover = None;
                 // 从「离开窗口这一刻」开始重新计时：2 秒后收起，
                 // 而不是接着上一次鼠标移动的时间算（那样刚移出去就立刻收起）。
                 self.touch();
@@ -2560,7 +2642,12 @@ impl App {
                 self.speed_popover = false;
                 self.context = None;
                 self.playlist.open = false;
+                self.playlist.hover = None;
                 self.info_open = false;
+                // 每次打开都重数一遍关联状态：用户可能刚在系统设置里改过
+                if self.settings.open {
+                    self.assoc_report = assoc::status();
+                }
             }
             Message::CloseSettings => {
                 self.touch();
@@ -2573,6 +2660,43 @@ impl App {
             Message::SetAutoplay(on) => {
                 self.settings.autoplay = on;
                 self.save_settings();
+            }
+            Message::SetRecent(on) => {
+                self.touch();
+                self.settings.recent = on;
+                // 走 state 的 setter：关掉的那一刻把攒下的列表一起清空，
+                // 不是只在界面里藏起来（设置页的说明也是这么写的）
+                self.state.set_recent_enabled(on);
+                self.save_settings();
+                if !on {
+                    // 清空这件事要立刻落盘，别等那个 3 秒的节流：
+                    // 用户点完关掉就去关程序的话，记录还留在文件里就白关了
+                    let _ = self.state.save();
+                }
+            }
+            Message::SetSeekStep(secs) => {
+                self.settings.seek_step = secs.clamp(1.0, 60.0);
+                self.save_settings();
+            }
+            Message::AssociateAll => {
+                self.touch();
+                match assoc::associate_all() {
+                    Ok(rep) => {
+                        self.assoc_report = rep;
+                        self.toast(if rep.complete() {
+                            format!("已关联全部 {} 种格式", rep.total)
+                        } else {
+                            format!(
+                                "已关联 {} / {} 种格式，其余可在系统设置里指定",
+                                rep.linked, rep.total
+                            )
+                        });
+                    }
+                    Err(e) => {
+                        self.assoc_report = assoc::status();
+                        self.toast(format!("关联失败：{e}"));
+                    }
+                }
             }
             Message::OpenRepo => {
                 self.touch();
@@ -2660,6 +2784,8 @@ impl App {
             Message::TogglePlaylist => {
                 self.touch();
                 self.playlist.open = !self.playlist.open;
+                // 抽屉一收，悬停状态也跟着作废：下次打开时鼠标可能根本不在列表上
+                self.playlist.hover = None;
                 // 几个浮层同时开着会叠在一起，谁最后开听谁的
                 self.volume_popover = false;
                 self.sub_popover = false;
@@ -2667,6 +2793,22 @@ impl App {
                 self.context = None;
                 self.settings.close();
                 self.info_open = false;
+            }
+            Message::ItemHover(i) => self.playlist.hover = Some(i),
+            Message::ItemUnhover(i) => {
+                // 只清自己那条：移动方向不同时，「进入新行」和「离开旧行」的
+                // 先后顺序会反过来，不带下标就把刚设好的新行擦掉了
+                if self.playlist.hover == Some(i) {
+                    self.playlist.hover = None;
+                }
+            }
+            Message::RevealItem(i) => {
+                // 只定位文件，不关抽屉 —— 用户可能想连着看好几条都在哪
+                if let Some(path) = self.playlist.items.get(i).map(|it| it.path.clone())
+                    && let Err(e) = win32::reveal_in_explorer(&path)
+                {
+                    self.error = Some(e);
+                }
             }
             Message::PlayIndex(i) => {
                 self.touch();
@@ -2774,9 +2916,7 @@ impl App {
                     self.seek_to_lyric(index);
                 }
                 self.touch();
-                self.playlist.open = false;
-                self.settings.close();
-                self.info_open = false;
+                self.dismiss_drawers();
                 self.volume_popover = false;
                 self.sub_popover = false;
                 self.speed_popover = false;
@@ -2802,6 +2942,11 @@ impl App {
             Message::LyricSeek(index) => self.seek_to_lyric(index),
             // 栏 / 覆盖层故意「吃掉」按下事件用的占位消息，到这里什么也不做
             Message::Noop => {}
+            // 点在顶栏 / 底栏的空白处：和点画面一样，把抽屉收起来
+            Message::BarPress => {
+                self.touch();
+                self.dismiss_drawers();
+            }
         }
         Task::none()
     }
@@ -3031,8 +3176,11 @@ impl App {
         if self.settings_anim > 0.002 {
             let shift = (settings::W + DRAWER_LEAD) * (1.0 - self.settings_anim);
             layers = layers.push(
-                Float::new(self.drawer_layer(settings::drawer(&self.settings), settings::W))
-                    .translate(move |_, _| Vector::new(shift, 0.0)),
+                Float::new(self.drawer_layer(
+                    settings::drawer(&self.settings, &self.assoc_report),
+                    settings::W,
+                ))
+                .translate(move |_, _| Vector::new(shift, 0.0)),
             );
         }
 
@@ -3082,70 +3230,70 @@ impl App {
             layers
         } else {
             layers
-            .push(edge_zone(
-                Direction::North,
-                Horizontal::Center,
-                Vertical::Top,
-                [0, EDGE as u16],
-                Fill,
-                Length::Fixed(EDGE),
-            ))
-            .push(edge_zone(
-                Direction::South,
-                Horizontal::Center,
-                Vertical::Bottom,
-                [0, EDGE as u16],
-                Fill,
-                Length::Fixed(EDGE),
-            ))
-            .push(edge_zone(
-                Direction::West,
-                Horizontal::Left,
-                Vertical::Center,
-                [EDGE as u16, 0],
-                Length::Fixed(EDGE),
-                Fill,
-            ))
-            .push(edge_zone(
-                Direction::East,
-                Horizontal::Right,
-                Vertical::Center,
-                [EDGE as u16, 0],
-                Length::Fixed(EDGE),
-                Fill,
-            ))
-            .push(edge_zone(
-                Direction::NorthWest,
-                Horizontal::Left,
-                Vertical::Top,
-                [0, 0],
-                Length::Fixed(EDGE),
-                Length::Fixed(EDGE),
-            ))
-            .push(edge_zone(
-                Direction::NorthEast,
-                Horizontal::Right,
-                Vertical::Top,
-                [0, 0],
-                Length::Fixed(EDGE),
-                Length::Fixed(EDGE),
-            ))
-            .push(edge_zone(
-                Direction::SouthWest,
-                Horizontal::Left,
-                Vertical::Bottom,
-                [0, 0],
-                Length::Fixed(EDGE),
-                Length::Fixed(EDGE),
-            ))
-            .push(edge_zone(
-                Direction::SouthEast,
-                Horizontal::Right,
-                Vertical::Bottom,
-                [0, 0],
-                Length::Fixed(EDGE),
-                Length::Fixed(EDGE),
-            ))
+                .push(edge_zone(
+                    Direction::North,
+                    Horizontal::Center,
+                    Vertical::Top,
+                    [0, EDGE as u16],
+                    Fill,
+                    Length::Fixed(EDGE),
+                ))
+                .push(edge_zone(
+                    Direction::South,
+                    Horizontal::Center,
+                    Vertical::Bottom,
+                    [0, EDGE as u16],
+                    Fill,
+                    Length::Fixed(EDGE),
+                ))
+                .push(edge_zone(
+                    Direction::West,
+                    Horizontal::Left,
+                    Vertical::Center,
+                    [EDGE as u16, 0],
+                    Length::Fixed(EDGE),
+                    Fill,
+                ))
+                .push(edge_zone(
+                    Direction::East,
+                    Horizontal::Right,
+                    Vertical::Center,
+                    [EDGE as u16, 0],
+                    Length::Fixed(EDGE),
+                    Fill,
+                ))
+                .push(edge_zone(
+                    Direction::NorthWest,
+                    Horizontal::Left,
+                    Vertical::Top,
+                    [0, 0],
+                    Length::Fixed(EDGE),
+                    Length::Fixed(EDGE),
+                ))
+                .push(edge_zone(
+                    Direction::NorthEast,
+                    Horizontal::Right,
+                    Vertical::Top,
+                    [0, 0],
+                    Length::Fixed(EDGE),
+                    Length::Fixed(EDGE),
+                ))
+                .push(edge_zone(
+                    Direction::SouthWest,
+                    Horizontal::Left,
+                    Vertical::Bottom,
+                    [0, 0],
+                    Length::Fixed(EDGE),
+                    Length::Fixed(EDGE),
+                ))
+                .push(edge_zone(
+                    Direction::SouthEast,
+                    Horizontal::Right,
+                    Vertical::Bottom,
+                    [0, 0],
+                    Length::Fixed(EDGE),
+                    Length::Fixed(EDGE),
+                ))
         };
 
         let layers: Element<'_, Message> = layers.width(Fill).height(Fill).into();
@@ -3285,7 +3433,11 @@ impl App {
             .and_then(|p| p.extension())
             .map(|e| e.to_string_lossy().to_uppercase())
             .unwrap_or_else(|| String::from("AUDIO"));
-        let state = if self.paused { "已暂停" } else { "正在播放" };
+        let state = if self.paused {
+            "已暂停"
+        } else {
+            "正在播放"
+        };
         let sub = match &self.tags.artist {
             Some(artist) => format!("{artist} · {ext} · {state}"),
             None => format!("{ext} · {state}"),
@@ -3340,8 +3492,7 @@ impl App {
                     .size(17)
                     .color(icon::TEXT),
                 text(err).font(icon::UI_FONT).size(13).color(icon::TEXT_DIM),
-                button(text("选择文件").font(icon::UI_FONT).size(13))
-                    .on_press(Message::OpenDialog),
+                button(text("选择文件").font(icon::UI_FONT).size(13)).on_press(Message::OpenDialog),
             ]
             .spacing(14)
             .align_x(Alignment::Center)
@@ -3369,9 +3520,7 @@ impl App {
         let mut brand = row![
             // logo 用真实的 PNG（编译期转成 RGBA 内嵌），不再是图标字体里的字形
             iced::widget::image(iced::widget::image::Handle::from_rgba(
-                LOGO_SRC,
-                LOGO_SRC,
-                LOGO_RGBA,
+                LOGO_SRC, LOGO_SRC, LOGO_RGBA,
             ))
             .width(Length::Fixed(LOGO_BAR))
             .height(Length::Fixed(LOGO_BAR)),
@@ -3583,7 +3732,9 @@ impl App {
         let buttons = row![
             container(left_group).width(Fill).align_x(Horizontal::Left),
             center,
-            container(right_group).width(Fill).align_x(Horizontal::Right),
+            container(right_group)
+                .width(Fill)
+                .align_x(Horizontal::Right),
         ]
         .align_y(Alignment::Center);
 
@@ -3594,7 +3745,8 @@ impl App {
 
         // 整条底栏都先吃下「按下」事件：不然点栏上的空白处会穿透到画面，
         // 松开时被画面那层当成「点画面」而暂停。内容（按钮、滑块）先处理事件，
-        // 它们自己捕获了的话这层就不再重复处理。
+        // 它们自己捕获了的话这层就不再重复处理 —— 所以这条消息只在点空处时来，
+        // 正好用来「点底栏 = 关抽屉」。
         let bar = mouse_area(
             container(inner)
                 .width(Fill)
@@ -3602,7 +3754,7 @@ impl App {
                 .align_y(Vertical::Center)
                 .style(bar_style),
         )
-        .on_press(Message::Noop);
+        .on_press(Message::BarPress);
 
         container(bar)
             .width(Fill)
@@ -3802,7 +3954,11 @@ impl App {
     fn context_menu(&self, at: Point) -> Element<'_, Message> {
         let panel = container(
             column![
-                menu_item(icon::FOLDER, "在资源管理器中打开", Message::RevealInExplorer),
+                menu_item(
+                    icon::FOLDER,
+                    "在资源管理器中打开",
+                    Message::RevealInExplorer
+                ),
                 menu_item(icon::INFO, "查看视频文件详情", Message::OpenInfo),
             ]
             .spacing(2)
@@ -3814,14 +3970,8 @@ impl App {
 
         Float::new(swallow(panel.into()))
             .translate(move |bounds: Rectangle, viewport: Rectangle| {
-                let x = at
-                    .x
-                    .min(viewport.width - bounds.width - 6.0)
-                    .max(6.0);
-                let y = at
-                    .y
-                    .min(viewport.height - bounds.height - 6.0)
-                    .max(6.0);
+                let x = at.x.min(viewport.width - bounds.width - 6.0).max(6.0);
+                let y = at.y.min(viewport.height - bounds.height - 6.0).max(6.0);
                 Vector::new(x - bounds.x, y - bounds.y)
             })
             .into()
@@ -4073,10 +4223,12 @@ fn lyric_layout(scroll: f32, height: f32, row_h: f32) -> (usize, f32) {
 
 /// 歌词那块的一块「没什么可看」的占位。
 fn lyrics_hint(title: &'static str, hint: Option<&'static str>) -> Element<'static, Message> {
-    let mut col = column![text(title)
-        .font(icon::UI_FONT)
-        .size(14.0)
-        .color(Color::from_rgba(1.0, 1.0, 1.0, 0.42))]
+    let mut col = column![
+        text(title)
+            .font(icon::UI_FONT)
+            .size(14.0)
+            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.42))
+    ]
     .spacing(8)
     .align_x(Alignment::Center);
 
@@ -4147,22 +4299,81 @@ fn font_specimen<'a>() -> Element<'a, Message> {
     };
 
     let rows = column![
-        specimen("SansSerif Normal 12", f(Family::SansSerif, Weight::Normal), 12.0),
-        specimen("SansSerif Semibold 12（当前）", f(Family::SansSerif, Weight::Semibold), 12.0),
-        specimen("SansSerif Normal 13", f(Family::SansSerif, Weight::Normal), 13.0),
-        specimen("SansSerif Semibold 13", f(Family::SansSerif, Weight::Semibold), 13.0),
-        specimen("SansSerif Bold 13", f(Family::SansSerif, Weight::Bold), 13.0),
-        specimen("YaHei UI Normal 13", f(Family::Name("Microsoft YaHei UI"), Weight::Normal), 13.0),
-        specimen("YaHei UI Semibold 13", f(Family::Name("Microsoft YaHei UI"), Weight::Semibold), 13.0),
-        specimen("YaHei UI Bold 13", f(Family::Name("Microsoft YaHei UI"), Weight::Bold), 13.0),
-        specimen("YaHei Normal 13", f(Family::Name("Microsoft YaHei"), Weight::Normal), 13.0),
-        specimen("Segoe UI Semibold 13", f(Family::Name("Segoe UI"), Weight::Semibold), 13.0),
-        specimen("YaHei UI Normal 14", f(Family::Name("Microsoft YaHei UI"), Weight::Normal), 14.0),
-        specimen("YaHei UI Normal 12", f(Family::Name("Microsoft YaHei UI"), Weight::Normal), 12.0),
+        specimen(
+            "SansSerif Normal 12",
+            f(Family::SansSerif, Weight::Normal),
+            12.0
+        ),
+        specimen(
+            "SansSerif Semibold 12（当前）",
+            f(Family::SansSerif, Weight::Semibold),
+            12.0
+        ),
+        specimen(
+            "SansSerif Normal 13",
+            f(Family::SansSerif, Weight::Normal),
+            13.0
+        ),
+        specimen(
+            "SansSerif Semibold 13",
+            f(Family::SansSerif, Weight::Semibold),
+            13.0
+        ),
+        specimen(
+            "SansSerif Bold 13",
+            f(Family::SansSerif, Weight::Bold),
+            13.0
+        ),
+        specimen(
+            "YaHei UI Normal 13",
+            f(Family::Name("Microsoft YaHei UI"), Weight::Normal),
+            13.0
+        ),
+        specimen(
+            "YaHei UI Semibold 13",
+            f(Family::Name("Microsoft YaHei UI"), Weight::Semibold),
+            13.0
+        ),
+        specimen(
+            "YaHei UI Bold 13",
+            f(Family::Name("Microsoft YaHei UI"), Weight::Bold),
+            13.0
+        ),
+        specimen(
+            "YaHei Normal 13",
+            f(Family::Name("Microsoft YaHei"), Weight::Normal),
+            13.0
+        ),
+        specimen(
+            "Segoe UI Semibold 13",
+            f(Family::Name("Segoe UI"), Weight::Semibold),
+            13.0
+        ),
+        specimen(
+            "YaHei UI Normal 14",
+            f(Family::Name("Microsoft YaHei UI"), Weight::Normal),
+            14.0
+        ),
+        specimen(
+            "YaHei UI Normal 12",
+            f(Family::Name("Microsoft YaHei UI"), Weight::Normal),
+            12.0
+        ),
         container(space()).height(Length::Fixed(10.0)),
-        specimen("当前标题字号 18", f(Family::SansSerif, Weight::Normal), 18.0),
-        specimen("当前标题字号 18 加粗", f(Family::SansSerif, Weight::Semibold), 18.0),
-        text(LABEL).size(18).font(icon::UI_FONT).color(icon::TEXT_DIM),
+        specimen(
+            "当前标题字号 18",
+            f(Family::SansSerif, Weight::Normal),
+            18.0
+        ),
+        specimen(
+            "当前标题字号 18 加粗",
+            f(Family::SansSerif, Weight::Semibold),
+            18.0
+        ),
+        text(LABEL)
+            .size(18)
+            .font(icon::UI_FONT)
+            .color(icon::TEXT_DIM),
     ]
     .spacing(9)
     .width(Length::Fixed(760.0));
@@ -4195,9 +4406,7 @@ fn edge_zone<'a>(
         Direction::North | Direction::South => mouse::Interaction::ResizingVertically,
         Direction::East | Direction::West => mouse::Interaction::ResizingHorizontally,
         Direction::NorthEast | Direction::SouthWest => mouse::Interaction::ResizingDiagonallyUp,
-        Direction::NorthWest | Direction::SouthEast => {
-            mouse::Interaction::ResizingDiagonallyDown
-        }
+        Direction::NorthWest | Direction::SouthEast => mouse::Interaction::ResizingDiagonallyDown,
     };
 
     let zone = mouse_area(container(space()).width(width).height(height))
@@ -4219,10 +4428,7 @@ fn edge_zone<'a>(
 fn bar_style(_t: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(Color::from_rgba(
-            0.0,
-            0.0,
-            0.0,
-            BAR_ALPHA,
+            0.0, 0.0, 0.0, BAR_ALPHA,
         ))),
         ..container::Style::default()
     }
@@ -4359,10 +4565,12 @@ const RECENT_W: f32 = 420.0;
 /// 标题用「最近播放」而不是「最近打开」：这里给出的位置就是上次停下的地方，
 /// 点下去会从那儿续上，叫「播放」才不误导。
 fn recent_block(rows: Vec<(PathBuf, Option<state::Progress>)>) -> Element<'static, Message> {
-    let mut list = column![text("最近播放")
-        .font(icon::UI_FONT)
-        .size(12.0)
-        .color(icon::TEXT_FAINT)]
+    let mut list = column![
+        text("最近播放")
+            .font(icon::UI_FONT)
+            .size(12.0)
+            .color(icon::TEXT_FAINT)
+    ]
     .spacing(4)
     .width(Length::Fixed(RECENT_W));
 
@@ -4414,16 +4622,21 @@ fn recent_block(rows: Vec<(PathBuf, Option<state::Progress>)>) -> Element<'stati
 
 /// 空白页上的文字按钮（描边胶囊），比图标按钮更适合放中文标签
 fn pill_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
-    button(text(label).font(icon::UI_FONT).size(14).color(icon::TEXT_DIM))
-        .padding(Padding {
-            top: 7.0,
-            right: 14.0,
-            bottom: 7.0,
-            left: 14.0,
-        })
-        .on_press(msg)
-        .style(pill_style)
-        .into()
+    button(
+        text(label)
+            .font(icon::UI_FONT)
+            .size(14)
+            .color(icon::TEXT_DIM),
+    )
+    .padding(Padding {
+        top: 7.0,
+        right: 14.0,
+        bottom: 7.0,
+        left: 14.0,
+    })
+    .on_press(msg)
+    .style(pill_style)
+    .into()
 }
 
 fn pill_style(_t: &Theme, status: button::Status) -> button::Style {
@@ -4470,14 +4683,11 @@ fn icon_button_tinted<'a>(
 /// 暂停图标当年也是这么处理过来的 —— 用圆角容器手绘，尺寸按 17px 图标字形的
 /// 视觉重量对：机身 16×11、镜头 ⌀6、顶部一小块取景凸起。
 fn screenshot_button<'a>() -> Element<'a, Message> {
-    button(
-        container(camera_icon())
-            .center(Length::Fixed(ICON_BTN)),
-    )
-    .padding(0)
-    .on_press(Message::Screenshot)
-    .style(ghost_button)
-    .into()
+    button(container(camera_icon()).center(Length::Fixed(ICON_BTN)))
+        .padding(0)
+        .on_press(Message::Screenshot)
+        .style(ghost_button)
+        .into()
 }
 
 fn camera_icon<'a>() -> Element<'a, Message> {
@@ -4610,7 +4820,10 @@ fn menu_item<'a>(glyph: char, label: &'a str, msg: Message) -> Element<'a, Messa
                 .font(icon::ICON_FONT)
                 .size(13)
                 .color(icon::TEXT_FAINT),
-            text(label).font(icon::UI_FONT).size(13).color(icon::TEXT_DIM),
+            text(label)
+                .font(icon::UI_FONT)
+                .size(13)
+                .color(icon::TEXT_DIM),
         ]
         .spacing(9)
         .align_y(Alignment::Center)
@@ -4685,7 +4898,8 @@ fn fmt_speed(speed: f64) -> String {
 }
 
 /// 左上角「logo + 程序名」按钮：置顶时常亮一块底色，平时只有 hover / 按下才亮
-fn brand_button(_t: &Theme, status: button::Status, pinned: bool) -> button::Style {    use button::Status;
+fn brand_button(_t: &Theme, status: button::Status, pinned: bool) -> button::Style {
+    use button::Status;
 
     let bg = match status {
         Status::Pressed => Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.20))),
@@ -4720,16 +4934,17 @@ fn solid_button(_t: &Theme, _status: button::Status) -> button::Style {
 
 fn window_button<'a>(glyph: char, msg: Message, danger: bool) -> Element<'a, Message> {
     button(
-        container(text(glyph).font(icon::ICON_FONT).size(13).color(icon::TEXT_DIM))
-            .center(Length::Fixed(30.0)),
+        container(
+            text(glyph)
+                .font(icon::ICON_FONT)
+                .size(13)
+                .color(icon::TEXT_DIM),
+        )
+        .center(Length::Fixed(30.0)),
     )
     .padding(0)
     .on_press(msg)
-    .style(if danger {
-        close_button
-    } else {
-        ghost_button
-    })
+    .style(if danger { close_button } else { ghost_button })
     .into()
 }
 
@@ -4778,13 +4993,10 @@ fn play_button<'a>(paused: bool) -> Element<'a, Message> {
             .into()
     } else {
         // 字体里没有「暂停」字形，用两根圆角竖条画
-        row![
-            pause_bar(),
-            pause_bar(),
-        ]
-        .spacing(5)
-        .align_y(Alignment::Center)
-        .into()
+        row![pause_bar(), pause_bar(),]
+            .spacing(5)
+            .align_y(Alignment::Center)
+            .into()
     };
 
     button(container(glyph).center(Length::Fixed(46.0)))
@@ -5011,10 +5223,7 @@ mod tests {
 
     #[test]
     fn next_and_prev_walk_the_playlist() {
-        let root = make_dir(
-            "qp_test_drop_walk",
-            &["a1.mp4", "a2.mp4", "a3.mp4"],
-        );
+        let root = make_dir("qp_test_drop_walk", &["a1.mp4", "a2.mp4", "a3.mp4"]);
 
         let mut app = app();
         let _ = app.update(Message::Dropped(root.clone()));
@@ -5140,16 +5349,123 @@ mod tests {
     /// 自动连播默认关：用户没勾就不该替他把下一集放出来
     #[test]
     fn autoplay_is_off_by_default() {
-        let app = app();
-        assert!(!app.settings.autoplay);
+        // 「出厂值」看 state / settings 的 Default，而不是看 App 里的运行时值：
+        // App 会把本地 state.json 里用户自己的选择还原回来（这台机器上它就是开着的）
+        assert!(!State::default().autoplay);
+        assert!(!Settings::default().autoplay);
 
-        // 打开设置抽屉不会顺手把它勾上
-        let mut app = app;
+        let mut app = app();
+        let before = app.settings.autoplay;
+
+        // 打开设置抽屉不会顺手把它翻个面
         let _ = app.update(Message::OpenSettings);
-        assert!(!app.settings.autoplay);
+        assert_eq!(app.settings.autoplay, before);
 
         let _ = app.update(Message::SetAutoplay(true));
         assert!(app.settings.autoplay);
+    }
+
+    /// 「最近播放」默认关：开关要同步到配置里，关掉时把攒下的记录一起清空
+    #[test]
+    fn recent_toggle_syncs_to_state() {
+        assert!(!State::default().recent_enabled, "出厂默认必须是关的");
+        assert!(!Settings::default().recent);
+
+        let mut app = app();
+
+        let _ = app.update(Message::SetRecent(true));
+        assert!(app.settings.recent);
+        assert!(app.state.recent_enabled, "开关要落进配置，重启还记得");
+
+        // 塞一条旧记录，再关掉：不能只藏起来，得从配置里删。
+        // 先清空是因为这份 App 会把本机 state.json 里已有的历史读回来。
+        app.state.recent.clear();
+        app.state.remember(std::path::Path::new("D:/x.mp4"));
+        assert_eq!(app.state.recent.len(), 1);
+
+        let _ = app.update(Message::SetRecent(false));
+        assert!(!app.settings.recent);
+        assert!(!app.state.recent_enabled);
+        assert!(app.state.recent.is_empty(), "关掉要把旧记录清空");
+    }
+
+    /// 抽屉开着时点**顶栏 / 底栏空白处**（还有进度条）都要把它收起来。
+    ///
+    /// 以前只有画面那层透明 cover 会关抽屉，而 cover 压在顶底栏下面（不这样
+    /// 播放键就点不动了），于是点顶栏、点底栏、拖进度条都是一点反应都没有。
+    #[test]
+    fn clicks_outside_the_panel_close_it() {
+        let mut app = app();
+
+        // 顶栏：按下去是「拖窗口」那条消息，顺手也要关抽屉
+        let _ = app.update(Message::OpenSettings);
+        assert!(app.settings.open);
+        let _ = app.update(Message::WinDrag);
+        assert!(!app.settings.open, "点顶栏要关设置");
+
+        // 底栏空白处
+        let _ = app.update(Message::TogglePlaylist);
+        assert!(app.playlist.open);
+        let _ = app.update(Message::BarPress);
+        assert!(!app.playlist.open, "点底栏空白处要关播放列表");
+
+        // 进度条：滑块自己吃掉了按下事件，走的是 Seek
+        let _ = app.update(Message::OpenSettings);
+        assert!(app.settings.open);
+        let _ = app.update(Message::Seek(3.0));
+        assert!(!app.settings.open, "拖进度条也要关抽屉");
+    }
+
+    /// ← / → 的步长跟着设置走，提示里的秒数也得跟着变成一样的
+    #[test]
+    fn arrow_step_follows_the_setting() {
+        let mut app = playing_at(10.0);
+
+        let _ = app.update(Message::SetSeekStep(20.0));
+        assert_eq!(app.state.seek_step, 20.0, "步长要存进配置");
+
+        let _ = app.update(Message::NudgeArrow(1));
+        assert_eq!(app.position, 30.0, "选了 20 秒就该跳 20 秒");
+        assert_eq!(
+            app.notice.as_ref().map(|n| n.0.as_str()),
+            Some("前进 20 秒")
+        );
+
+        app.seek_at = None;
+        let _ = app.update(Message::NudgeArrow(-1));
+        assert_eq!(app.position, 10.0);
+        assert_eq!(
+            app.notice.as_ref().map(|n| n.0.as_str()),
+            Some("后退 20 秒")
+        );
+
+        // 出厂值是 5 秒，提示里的数字同样要跟着
+        let _ = app.update(Message::SetSeekStep(crate::keys::SEEK_STEP));
+        app.seek_at = None;
+        let _ = app.update(Message::NudgeArrow(1));
+        assert_eq!(app.notice.as_ref().map(|n| n.0.as_str()), Some("前进 5 秒"));
+    }
+
+    /// 列表的悬停状态按下标记：移开旧行的那条消息不能把新行擦掉
+    #[test]
+    fn row_hover_is_tracked_per_index() {
+        let mut app = app();
+
+        let _ = app.update(Message::ItemHover(1));
+        assert_eq!(app.playlist.hover, Some(1));
+
+        // 往上一行移动时，「进入第 1 行」可能先于「离开第 2 行」送到
+        let _ = app.update(Message::ItemHover(0));
+        let _ = app.update(Message::ItemUnhover(1));
+        assert_eq!(app.playlist.hover, Some(0), "旧行的离开消息不该擦掉新行");
+
+        let _ = app.update(Message::ItemUnhover(0));
+        assert_eq!(app.playlist.hover, None);
+
+        // 关掉抽屉时悬停状态作废
+        let _ = app.update(Message::ItemHover(2));
+        let _ = app.update(Message::TogglePlaylist);
+        assert_eq!(app.playlist.hover, None);
     }
     /// 倍速文案：整数倍也要带一位小数（`1.0×` 而不是 `1×`），1.25 / 1.75 不能丢位
     #[test]
@@ -5284,7 +5600,11 @@ mod tests {
         }
 
         // 平时的门（80ms）已经开了，但有旧画面顶着，这时候还不该画
-        assert_eq!(at!(80 + 200), 0.0, "画面还连着的时候就画圈，会暗一下再亮回来");
+        assert_eq!(
+            at!(80 + 200),
+            0.0,
+            "画面还连着的时候就画圈，会暗一下再亮回来"
+        );
         assert_eq!(at!(399), 0.0);
 
         // 真的卡住了（超过 STALE_SPIN_DELAY）才转起来
@@ -5454,7 +5774,11 @@ mod tests {
             app.animate();
         }
         let shown = |a: &App| a.lyric_scroll.value() + a.lyric_browse.value();
-        assert!((shown(&app) - 0.0).abs() < 0.05, "没滚到顶：{}", shown(&app));
+        assert!(
+            (shown(&app) - 0.0).abs() < 0.05,
+            "没滚到顶：{}",
+            shown(&app)
+        );
 
         // 播放往前唱了两句：视图要还在原处
         app.lyric_line = Some(4);
@@ -6038,11 +6362,17 @@ mod tests {
         let mut app = app();
         app.duration = 0.0;
         app.bars = 1.0;
-        assert!(app.bar_hover_at(Point::new(600.0, 13.0)).is_none(), "没时长不该弹预览");
+        assert!(
+            app.bar_hover_at(Point::new(600.0, 13.0)).is_none(),
+            "没时长不该弹预览"
+        );
 
         app.duration = 60.0;
         app.bars = 0.0;
-        assert!(app.bar_hover_at(Point::new(600.0, 13.0)).is_none(), "底栏收着不该弹预览");
+        assert!(
+            app.bar_hover_at(Point::new(600.0, 13.0)).is_none(),
+            "底栏收着不该弹预览"
+        );
 
         app.bars = 1.0;
         assert!(app.bar_hover_at(Point::new(600.0, 13.0)).is_some());
@@ -6064,12 +6394,20 @@ mod tests {
         // 光标挪到别处（换了格子），但还没到节流窗口：不该再发
         app.bar_hover = app.bar_hover_at(Point::new(900.0, 13.0));
         app.tick_thumbs();
-        assert_eq!(app.thumb_asked.as_ref(), Some(&first), "节流窗口内不该再发请求");
+        assert_eq!(
+            app.thumb_asked.as_ref(),
+            Some(&first),
+            "节流窗口内不该再发请求"
+        );
 
         // 窗口过了：换新格子就该发出去 —— 关键是这里**没有**停下来等
         app.thumb_sent = Some(Instant::now() - App::THUMB_THROTTLE - Duration::from_millis(5));
         app.tick_thumbs();
-        assert_ne!(app.thumb_asked, Some(first.clone()), "节流过了还在扫，就该换下一格");
+        assert_ne!(
+            app.thumb_asked,
+            Some(first.clone()),
+            "节流过了还在扫，就该换下一格"
+        );
 
         // 同一格上反复 tick 不会重复发
         let now = app.thumb_asked.clone();

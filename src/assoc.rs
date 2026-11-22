@@ -88,9 +88,8 @@ const APP_ID: &str = "Maneki";
 /// 这个顺序只影响我们自己和用户的阅读。
 pub const EXTS: &[&str] = &[
     // 视频
-    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".ts", ".m2ts", ".mts", ".rmvb",
-    ".rm", ".m4v", ".mpg", ".mpeg", ".ogv", ".3gp", ".vob", ".asf", ".mka",
-    // 音频
+    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".ts", ".m2ts", ".mts", ".rmvb", ".rm",
+    ".m4v", ".mpg", ".mpeg", ".ogv", ".3gp", ".vob", ".asf", ".mka", // 音频
     ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".ape", ".aiff",
     ".aif", ".alac", ".mp2", ".ac3", ".dts",
 ];
@@ -145,15 +144,8 @@ impl Key {
     fn open(path: &str) -> Option<Key> {
         let sub = wide(path);
         let mut handle: isize = 0;
-        let ok = unsafe {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                sub.as_ptr(),
-                0,
-                KEY_READ,
-                &mut handle,
-            )
-        };
+        let ok =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ, &mut handle) };
         (ok == 0 && handle != 0).then_some(Key(handle))
     }
 
@@ -181,9 +173,7 @@ impl Key {
     /// 写一个 REG_NONE 空值：只用来占个名字（OpenWithProgids / SupportedTypes）
     fn set_none(&self, name: &str) -> bool {
         let key = wide(name);
-        let ok = unsafe {
-            RegSetValueExW(self.0, key.as_ptr(), 0, REG_NONE, std::ptr::null(), 0)
-        };
+        let ok = unsafe { RegSetValueExW(self.0, key.as_ptr(), 0, REG_NONE, std::ptr::null(), 0) };
         ok == 0
     }
 
@@ -275,10 +265,7 @@ fn exe_path() -> String {
 fn exe_name() -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| String::from("maneki.exe"))
 }
 
@@ -306,10 +293,82 @@ pub fn ensure() {
 
 /// 这个后缀是不是已经被用户（或别的程序）明确指定过默认程序
 fn has_user_choice(ext: &str) -> bool {
-    Key::open(&format!(
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\{ext}\\UserChoice"
-    ))
-    .is_some()
+    Key::open(&user_choice_path(ext)).is_some()
+}
+
+fn user_choice_path(ext: &str) -> String {
+    format!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\{ext}\\UserChoice")
+}
+
+/// 用户给这个后缀挑的那个 ProgID（没有 UserChoice 就是 None）
+fn user_choice_progid(ext: &str) -> Option<String> {
+    get_str(&user_choice_path(ext), "ProgId")
+}
+
+/// 某个后缀**此刻**的实际默认程序是不是我们。
+///
+/// 系统只认 UserChoice（那是用户在「打开方式」里点出来的，带哈希校验）；
+/// 没有 UserChoice 时才退回 `Classes\<ext>` 的默认值 —— 后者才是我们能写的。
+fn is_default_for(ext: &str) -> bool {
+    match user_choice_progid(ext) {
+        Some(id) => id == PROG_ID,
+        None => get_str(&format!("Software\\Classes\\{ext}"), "").as_deref() == Some(PROG_ID),
+    }
+}
+
+/// 关联状态：拿来做设置页上那行「已关联 12 / 38 种格式」。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Report {
+    /// 一共注册了多少种后缀
+    pub total: usize,
+    /// 现在双击就会用 Maneki 打开的有多少
+    pub linked: usize,
+}
+
+impl Report {
+    /// 还差几个格式没归我们
+    pub fn pending(&self) -> usize {
+        self.total.saturating_sub(self.linked)
+    }
+
+    /// 全部格式都归我们了
+    pub fn complete(&self) -> bool {
+        self.total > 0 && self.linked >= self.total
+    }
+}
+
+/// 数一遍现在有多少后缀真的指向我们。读 38×2 个注册表值，几百微秒，
+/// 只在打开设置页 / 点完关联之后调，不要每帧调。
+pub fn status() -> Report {
+    Report {
+        total: EXTS.len(),
+        linked: EXTS.iter().filter(|e| is_default_for(e)).count(),
+    }
+}
+
+/// 「一键关联」：把**所有**后缀都改成用 Maneki 打开，中间不弹系统的选择框。
+///
+/// 关键的一步是删掉 `FileExts\<ext>\UserChoice`。Windows 8 之后这个键带哈希校验，
+/// 直接往里写 ProgId 会被判成「无效选择」然后重置 —— 但**删掉它是允许的**。
+/// 删掉之后系统回到老规则：看 `Classes\<ext>` 的默认值，而那个刚被我们指到
+/// `Maneki.Video`，于是双击直接开播，不会再问「用什么程序打开」。
+///
+/// 少数被系统驱动锁住的后缀（.pdf、.html 那类）删不掉，这时它还是留在原地，
+/// 界面上会显示成「x / y」，用户可以点旁边的按钮去系统设置里手动挑。
+pub fn associate_all() -> Result<Report, String> {
+    // 先把 ProgID / OpenWithProgids / Capabilities 写好，不然删了 UserChoice
+    // 系统就找不到该退给谁，反而会弹一次空的「选择程序」
+    register()?;
+
+    for ext in EXTS {
+        if has_user_choice(ext) && user_choice_progid(ext).as_deref() != Some(PROG_ID) {
+            delete_tree(&user_choice_path(ext));
+        }
+        put(&format!("Software\\Classes\\{ext}"), "", PROG_ID);
+    }
+
+    notify_shell();
+    Ok(status())
 }
 
 /// 注册成视频文件的打开方式。可重复调用。
@@ -326,7 +385,10 @@ pub fn register() -> Result<(), String> {
 
     // 2. 每个后缀挂到 ProgID 上，并进「打开方式」候选
     for ext in EXTS {
-        put_none(&format!("Software\\Classes\\{ext}\\OpenWithProgids"), PROG_ID);
+        put_none(
+            &format!("Software\\Classes\\{ext}\\OpenWithProgids"),
+            PROG_ID,
+        );
 
         // 用户没明确选过默认程序的后缀，直接把这个后缀的默认值指过来。
         // 已经有 UserChoice 的别碰 —— 系统会校验哈希，硬改只会被重置。
@@ -414,7 +476,9 @@ fn notify_shell() {
 /// 打开「设置 → 默认应用」里 Maneki 那一页，让用户自己点「设为默认」。
 pub fn open_default_apps() {
     let op = wide("open");
-    let uri = wide(&format!("ms-settings:defaultapps?registeredAppUser={APP_ID}"));
+    let uri = wide(&format!(
+        "ms-settings:defaultapps?registeredAppUser={APP_ID}"
+    ));
     const SW_SHOWNORMAL: i32 = 1;
     unsafe {
         ShellExecuteW(

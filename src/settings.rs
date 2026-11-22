@@ -1,4 +1,4 @@
-//! 设置抽屉：画面填充 / 画面比例 / 色彩调整 / 自动连播。
+//! 设置抽屉：通用 / 画面填充 / 画面比例 / 色彩调整 / 快捷键 / 关于。
 //!
 //! 原来是一个居中的弹窗，现在是**贴在右边的抽屉**，和播放列表长同一副样子：
 //! 同样宽度的竖条、同样的黑色半透明底、同样由 `main.rs` 用 `Float::translate`
@@ -12,12 +12,15 @@
 //! mpv 的 brightness/contrast 只在 gpu 类 VO 上有效，而这里是 libmpv 软渲染出帧，
 //! 走 mpv 那套在这条路径上不会生效，反而会让人怀疑是不是没刷新。
 
+use std::borrow::Cow;
+
 use iced::widget::{button, checkbox, column, container, row, scrollable, slider, space, text};
 use iced::{
     Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Vector,
     alignment::{Horizontal, Vertical},
 };
 
+use crate::assoc::Report;
 use crate::icon;
 use crate::video::{Aspect, FitMode, Look};
 use crate::{Message, audio, playlist};
@@ -27,8 +30,12 @@ pub const W: f32 = 344.0;
 /// 内容区左右内边距
 const PAD: f32 = 16.0;
 
+/// ← / → 能选的步长（秒）。设置 → 通用里一排按钮。
+pub const SEEK_STEPS: [u64; 5] = [3, 5, 10, 20, 30];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
+    General,
     #[default]
     Picture,
     Color,
@@ -39,6 +46,7 @@ pub enum Tab {
 impl Tab {
     fn label(self) -> &'static str {
         match self {
+            Tab::General => "通用",
             Tab::Picture => "画面",
             Tab::Color => "色彩",
             Tab::Keys => "快捷键",
@@ -46,7 +54,13 @@ impl Tab {
         }
     }
 
-    const ALL: [Tab; 4] = [Tab::Picture, Tab::Color, Tab::Keys, Tab::About];
+    const ALL: [Tab; 5] = [
+        Tab::General,
+        Tab::Picture,
+        Tab::Color,
+        Tab::Keys,
+        Tab::About,
+    ];
 }
 
 /// 色彩调整里能被点的那几项
@@ -59,7 +73,7 @@ pub enum Field {
     Sharpen,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     pub open: bool,
     pub tab: Tab,
@@ -69,6 +83,27 @@ pub struct Settings {
     /// 自动连播。**默认关**：一个视频放完就停在那里，
     /// 不要替用户决定「接着往下看」。
     pub autoplay: bool,
+    /// ← / → 一次跳多少秒（默认 5）
+    pub seek_step: f64,
+    /// 「最近播放」。**默认关** —— 空界面不主动列出用户看过什么。
+    pub recent: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            open: false,
+            tab: Tab::default(),
+            fit: FitMode::default(),
+            aspect: Aspect::default(),
+            look: Look::default(),
+            autoplay: false,
+            // 手写 Default 就是为了这一行：derive 出来的 f64 是 0，
+            // 没有哪个地方想要「一次跳 0 秒」。
+            seek_step: crate::keys::SEEK_STEP,
+            recent: false,
+        }
+    }
 }
 
 impl Settings {
@@ -95,7 +130,7 @@ impl Settings {
 ///
 /// 摆放位置和滑入滑出动画都在 `main.rs`（`Float::translate`），
 /// 这样播放列表和设置能共用同一套抽屉动作。
-pub fn drawer<'a>(s: &'a Settings) -> Element<'a, Message> {
+pub fn drawer<'a>(s: &'a Settings, assoc: &'a Report) -> Element<'a, Message> {
     let header = container(
         row![
             text("播放设置")
@@ -131,20 +166,19 @@ pub fn drawer<'a>(s: &'a Settings) -> Element<'a, Message> {
     });
 
     let content: Element<'a, Message> = match s.tab {
+        Tab::General => general_tab(s, assoc),
         Tab::Picture => picture_tab(s),
         Tab::Color => color_tab(s),
-        Tab::Keys => keys_tab(),
+        Tab::Keys => keys_tab(s.seek_step),
         Tab::About => about_tab(),
     };
 
-    let body = container(content)
-        .width(Fill)
-        .padding(Padding {
-            top: 12.0,
-            right: PAD,
-            bottom: 12.0,
-            left: PAD,
-        });
+    let body = container(content).width(Fill).padding(Padding {
+        top: 12.0,
+        right: PAD,
+        bottom: 12.0,
+        left: PAD,
+    });
 
     container(
         column![
@@ -195,29 +229,96 @@ fn rule<'a>() -> Element<'a, Message> {
         .into()
 }
 
+// ---------------- 通用 ----------------
+
+/// 通用：跳转步长、自动连播、文件关联。
+///
+/// 这三样都不是「画面」的事，以前自动连播挤在画面页最下面，关联文件干脆没有入口
+/// （只能靠命令行 `--register`）—— 用户找不到就等于没有。
+fn general_tab<'a>(s: &'a Settings, assoc: &'a Report) -> Element<'a, Message> {
+    let steps = row(SEEK_STEPS.iter().map(|v| {
+        segment_cell(
+            format!("{v} 秒"),
+            (s.seek_step - *v as f64).abs() < 0.01,
+            Message::SetSeekStep(*v as f64),
+        )
+    }))
+    .spacing(6)
+    .width(Fill);
+
+    // 关联状态那行：数字必须是「刚数出来的」，所以放在这里由上层传进来，
+    // 不在绘制时读注册表（一帧 38 个键，60Hz 就是每秒两千多次系统调用）。
+    let status = if assoc.total == 0 {
+        String::from("还没有登记任何格式")
+    } else if assoc.complete() {
+        format!(
+            "已关联全部 {} 种格式，双击视频直接用 Maneki 打开",
+            assoc.total
+        )
+    } else {
+        format!(
+            "已关联 {} / {} 种格式 · 还有 {} 种被别的程序占着",
+            assoc.linked,
+            assoc.total,
+            assoc.pending()
+        )
+    };
+
+    let hint_text = if assoc.pending() > 0 {
+        "剩下的格式可以点右边的按钮，去系统的「默认应用」里手动指定。"
+    } else {
+        "关联之后双击视频不会再问「用什么程序打开」。"
+    };
+
+    let col = column![
+        section("跳转"),
+        field_label("快退 / 快进一次跳"),
+        steps,
+        hint("按 ← / → 时跳过的秒数；J / L 固定跳 10 秒。"),
+        gap(16.0),
+        section("播放"),
+        toggle_row("自动连播", s.autoplay, Message::SetAutoplay),
+        toggle_row("记录最近播放", s.recent, Message::SetRecent),
+        hint(if s.recent {
+            "空界面上会列出最近看过的片子，点一条接着看。关掉会清空已有记录。"
+        } else {
+            "关闭时不记录任何播放历史，空界面也不显示「最近播放」。"
+        }),
+        gap(16.0),
+        section("文件关联"),
+        hint(status),
+        row![
+            primary_button("一键关联全部格式", Message::AssociateAll),
+            container(space()).width(Fill),
+            text_button("系统默认应用", Message::OpenDefaultApps, true),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        hint(hint_text),
+    ]
+    .spacing(8)
+    .width(Fill);
+
+    container(col).width(Fill).into()
+}
+
 // ---------------- 画面 ----------------
 
 fn picture_tab(s: &Settings) -> Element<'_, Message> {
-    let fill = row(FitMode::ALL.iter().map(|m| segment(
-        m.label(),
-        s.fit == *m,
-        Message::SetFit(*m),
-    )))
+    let fill = row(FitMode::ALL
+        .iter()
+        .map(|m| segment(m.label(), s.fit == *m, Message::SetFit(*m))))
     .spacing(6);
 
     // 五个比例按钮一行塞不下 344px 的抽屉，拆成 3 + 2 两排；
     // 第二排补一格空白，两排的格子才对得上。
-    let aspect_a = row(
-        Aspect::ALL[..3]
-            .iter()
-            .map(|a| segment(a.label(), s.aspect == *a, Message::SetAspect(*a))),
-    )
+    let aspect_a = row(Aspect::ALL[..3]
+        .iter()
+        .map(|a| segment(a.label(), s.aspect == *a, Message::SetAspect(*a))))
     .spacing(6);
-    let mut aspect_b = row(
-        Aspect::ALL[3..]
-            .iter()
-            .map(|a| segment(a.label(), s.aspect == *a, Message::SetAspect(*a))),
-    )
+    let mut aspect_b = row(Aspect::ALL[3..]
+        .iter()
+        .map(|a| segment(a.label(), s.aspect == *a, Message::SetAspect(*a))))
     .spacing(6);
     aspect_b = aspect_b.push(container(space()).width(Fill));
 
@@ -228,9 +329,6 @@ fn picture_tab(s: &Settings) -> Element<'_, Message> {
         section("画面比例"),
         aspect_a,
         aspect_b,
-        gap(16.0),
-        section("播放"),
-        autoplay_row(s.autoplay),
     ]
     .spacing(8)
     .width(Fill);
@@ -238,16 +336,20 @@ fn picture_tab(s: &Settings) -> Element<'_, Message> {
     container(col).width(Fill).into()
 }
 
-/// 「自动连播」勾选项
-fn autoplay_row(on: bool) -> Element<'static, Message> {
+/// 一行勾选项（自动连播 / 最近播放）
+fn toggle_row(
+    label: &'static str,
+    on: bool,
+    msg: impl Fn(bool) -> Message + 'static,
+) -> Element<'static, Message> {
     container(
         checkbox(on)
-            .label("自动连播")
+            .label(label)
             .text_size(13.5)
             .font(icon::UI_FONT)
             .size(18)
             .spacing(9)
-            .on_toggle(Message::SetAutoplay)
+            .on_toggle(msg)
             .style(checkbox_style),
     )
     .width(Fill)
@@ -482,9 +584,11 @@ fn fmt_block(label: &'static str, value: String) -> Element<'static, Message> {
 /// 快捷键说明：左边键位（等宽胶囊）、右边功能。
 ///
 /// 内容来自 `keys.rs` 的 `GROUPS` —— 和真正生效的键位是同一份数据，
-/// 不会出现「说明里写了、按下去没反应」。
-fn keys_tab() -> Element<'static, Message> {
+/// 不会出现「说明里写了、按下去没反应」。带 `{seek}` 的那几行会把
+/// 设置里选的步长填进去，改了跳转秒数说明也跟着变。
+fn keys_tab(seek: f64) -> Element<'static, Message> {
     let mut col = column![].spacing(6).width(Fill);
+    let step = crate::ui::fmt_secs(seek);
 
     for (i, (group, rows)) in crate::keys::GROUPS.iter().enumerate() {
         if i > 0 {
@@ -492,7 +596,7 @@ fn keys_tab() -> Element<'static, Message> {
         }
         col = col.push(section(group));
         for s in rows.iter() {
-            col = col.push(key_row(s.keys, s.what));
+            col = col.push(key_row(s.keys, &s.what.replace("{seek}", &step)));
         }
     }
 
@@ -508,23 +612,27 @@ fn keys_tab() -> Element<'static, Message> {
     container(col).width(Fill).into()
 }
 
-/// 一行快捷键：键位块 + 说明。键位块定宽，右半边才对得齐。
-fn key_row(keys: &'static str, what: &'static str) -> Element<'static, Message> {
+/// 一行快捷键：键位块 + 说明。
+///
+/// 键位块**定宽**、文字**左对齐**：这样每一行的键位都从同一个 x 起步、右边又都收在
+/// 同一个胶囊边里，两列（键位 / 说明）看上去就是齐的。以前文字在胶囊里居中，
+/// 「M」和「Ctrl + 左右」各自往中间缩，左边缘参差不齐，整页像没对齐。
+fn key_row(keys: &'static str, what: impl Into<String>) -> Element<'static, Message> {
     row![
         container(
             text(keys)
                 .font(icon::UI_FONT)
                 .size(12.0)
                 .color(icon::TEXT)
-                .align_x(Horizontal::Center)
+                .align_x(Horizontal::Left)
                 .width(Fill),
         )
         .width(Length::Fixed(126.0))
         .padding(Padding {
             top: 4.0,
-            right: 6.0,
+            right: 8.0,
             bottom: 4.0,
-            left: 6.0,
+            left: 8.0,
         })
         .style(|_| container::Style {
             background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.07))),
@@ -536,7 +644,7 @@ fn key_row(keys: &'static str, what: &'static str) -> Element<'static, Message> 
             ..container::Style::default()
         }),
         // 说明文字：长了自己换行，不把右边界撑破
-        text(what)
+        text(what.into())
             .font(icon::UI_FONT)
             .size(12.5)
             .color(icon::TEXT_DIM)
@@ -667,38 +775,33 @@ fn field_label(label: &'static str) -> Element<'static, Message> {
 
 /// 强调色文字按钮（当链接用）
 fn link_button(label: &'static str, msg: Message) -> Element<'static, Message> {
-    button(
-        text(label)
-            .font(icon::UI_FONT)
-            .size(13)
-            .color(icon::ACCENT),
-    )
-    .padding(Padding {
-        top: 7.0,
-        right: 12.0,
-        bottom: 7.0,
-        left: 12.0,
-    })
-    .on_press(msg)
-    .style(|_t, status| {
-        use button::Status;
-        let bg = match status {
-            Status::Hovered => Color::from_rgba(0.36, 0.72, 0.98, 0.16),
-            Status::Pressed => Color::from_rgba(0.36, 0.72, 0.98, 0.24),
-            _ => Color::from_rgba(0.36, 0.72, 0.98, 0.08),
-        };
-        button::Style {
-            background: Some(Background::Color(bg)),
-            text_color: icon::ACCENT,
-            border: Border {
-                radius: 7.0.into(),
-                width: 1.0,
-                color: Color::from_rgba(0.36, 0.72, 0.98, 0.35),
-            },
-            ..button::Style::default()
-        }
-    })
-    .into()
+    button(text(label).font(icon::UI_FONT).size(13).color(icon::ACCENT))
+        .padding(Padding {
+            top: 7.0,
+            right: 12.0,
+            bottom: 7.0,
+            left: 12.0,
+        })
+        .on_press(msg)
+        .style(|_t, status| {
+            use button::Status;
+            let bg = match status {
+                Status::Hovered => Color::from_rgba(0.36, 0.72, 0.98, 0.16),
+                Status::Pressed => Color::from_rgba(0.36, 0.72, 0.98, 0.24),
+                _ => Color::from_rgba(0.36, 0.72, 0.98, 0.08),
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: icon::ACCENT,
+                border: Border {
+                    radius: 7.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgba(0.36, 0.72, 0.98, 0.35),
+                },
+                ..button::Style::default()
+            }
+        })
+        .into()
 }
 
 // ---------------- 小部件 ----------------
@@ -716,9 +819,9 @@ fn tab_button(tab: Tab, active: bool) -> Element<'static, Message> {
     .width(Fill)
     .padding(Padding {
         top: 7.0,
-        right: 10.0,
+        right: 6.0,
         bottom: 7.0,
-        left: 10.0,
+        left: 6.0,
     })
     .on_press(Message::SettingsTab(tab))
     .style(move |_t, status| {
@@ -741,12 +844,33 @@ fn tab_button(tab: Tab, active: bool) -> Element<'static, Message> {
     .into()
 }
 
+/// 分段按钮（画面填充 / 画面比例 / 跳转步长都用它）。
+///
+/// 文字必须**包一层容器再居中对齐**：iced 的 `button` 只按 padding 把内容摆在左上角
+/// （`layout::padded` 不做居中），直接塞一段 `text` 会贴着左边，右边空一大截。
 fn segment<'a>(label: &'a str, active: bool, msg: Message) -> Element<'a, Message> {
-    button(text(label).font(icon::UI_FONT).size(13.5).color(if active {
-        Color::from_rgb(0.05, 0.06, 0.08)
-    } else {
-        icon::TEXT_DIM
-    }))
+    segment_cell(Cow::Borrowed(label), active, msg)
+}
+
+fn segment_cell<'a>(
+    label: impl Into<Cow<'a, str>>,
+    active: bool,
+    msg: Message,
+) -> Element<'a, Message> {
+    button(
+        container(
+            text(label.into())
+                .font(icon::UI_FONT)
+                .size(13.5)
+                .color(if active {
+                    Color::from_rgb(0.05, 0.06, 0.08)
+                } else {
+                    icon::TEXT_DIM
+                }),
+        )
+        .width(Fill)
+        .align_x(Horizontal::Center),
+    )
     .width(Fill)
     .padding(Padding {
         top: 7.0,
@@ -776,17 +900,58 @@ fn segment<'a>(label: &'a str, active: bool, msg: Message) -> Element<'a, Messag
     .into()
 }
 
-fn text_button<'a>(label: &'a str, msg: Message, enabled: bool) -> Element<'a, Message> {
-    let b = button(
+/// 强调色实心按钮（「一键关联」这种要人点的主动作）
+fn primary_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
+    button(
         text(label)
             .font(icon::UI_FONT)
             .size(13)
-            .color(if enabled {
-                icon::TEXT_DIM
-            } else {
-                Color::from_rgba(1.0, 1.0, 1.0, 0.28)
-            }),
+            .color(Color::from_rgb(0.05, 0.06, 0.08)),
     )
+    .padding(Padding {
+        top: 7.0,
+        right: 13.0,
+        bottom: 7.0,
+        left: 13.0,
+    })
+    .on_press(msg)
+    .style(|_t, status| {
+        use button::Status;
+        let bg = match status {
+            Status::Hovered => Color::from_rgb(0.47, 0.79, 1.0),
+            Status::Pressed => Color::from_rgb(0.30, 0.64, 0.92),
+            _ => icon::ACCENT,
+        };
+        button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: Color::from_rgb(0.05, 0.06, 0.08),
+            border: Border {
+                radius: 7.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
+/// 说明性小字（浅色、自动换行）
+fn hint<'a>(content: impl Into<String>) -> Element<'a, Message> {
+    text(content.into())
+        .font(icon::UI_FONT)
+        .size(12.0)
+        .line_height(1.45)
+        .color(icon::TEXT_FAINT)
+        .width(Fill)
+        .into()
+}
+
+fn text_button<'a>(label: &'a str, msg: Message, enabled: bool) -> Element<'a, Message> {
+    let b = button(text(label).font(icon::UI_FONT).size(13).color(if enabled {
+        icon::TEXT_DIM
+    } else {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.28)
+    }))
     .padding(Padding {
         top: 6.0,
         right: 11.0,
@@ -812,13 +977,22 @@ fn text_button<'a>(label: &'a str, msg: Message, enabled: bool) -> Element<'a, M
         }
     });
 
-    if enabled { b.on_press(msg).into() } else { b.into() }
+    if enabled {
+        b.on_press(msg).into()
+    } else {
+        b.into()
+    }
 }
 
 fn icon_only<'a>(glyph: char, size: f32, msg: Message) -> Element<'a, Message> {
     button(
-        container(text(glyph).font(icon::ICON_FONT).size(size).color(icon::TEXT_FAINT))
-            .center(Length::Fixed(26.0)),
+        container(
+            text(glyph)
+                .font(icon::ICON_FONT)
+                .size(size)
+                .color(icon::TEXT_FAINT),
+        )
+        .center(Length::Fixed(26.0)),
     )
     .padding(0)
     .on_press(msg)

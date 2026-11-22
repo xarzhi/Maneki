@@ -48,10 +48,15 @@ pub struct State {
     pub aspect: Aspect,
     pub look: Look,
     pub autoplay: bool,
+    /// ← / → 一次跳多少秒（设置 → 通用里选，默认 5）
+    pub seek_step: f64,
     /// 路径键 → 播放记录
     pub progress: HashMap<String, Progress>,
     /// 最近打开过的文件（最新的在前，最多 `RECENT_MAX` 条）
     pub recent: Vec<String>,
+    /// 是否开启「最近播放」。**默认关**：空界面不该默认就把用户看过哪些片子
+    /// 摊在屏幕上 —— 这是个隐私开关，想用的人自己去设置里打开。
+    pub recent_enabled: bool,
 }
 
 /// 最近列表上限。再多也没人往下翻，还让文件越写越大。
@@ -68,8 +73,10 @@ impl Default for State {
             aspect: Aspect::Auto,
             look: Look::default(),
             autoplay: false,
+            seek_step: crate::keys::SEEK_STEP,
             progress: HashMap::new(),
             recent: Vec::new(),
+            recent_enabled: false,
         }
     }
 }
@@ -135,6 +142,14 @@ impl State {
         if let Some(x) = flag("autoplay") {
             s.autoplay = x;
         }
+        if let Some(x) = flag("recent_enabled") {
+            s.recent_enabled = x;
+        }
+        if let Some(x) = num("seek_step") {
+            // 只夹范围，不强行对齐到那几个预设：以后加一档 8 秒，
+            // 老配置里的 8 也还能原样读回来。
+            s.seek_step = x.clamp(1.0, 60.0);
+        }
         if let Some(x) = v.get("fit").and_then(|x| x.as_str()) {
             s.fit = fit_from_id(x);
         }
@@ -165,7 +180,11 @@ impl State {
                 }
             }
         }
-        if let Some(list) = v.get("recent").and_then(|x| x.as_array()) {
+        // 开关关着就别把历史读进来：老配置里可能有上次关掉之前留下的记录，
+        // 读进内存只会让它在下次存盘时又被写回去
+        if s.recent_enabled
+            && let Some(list) = v.get("recent").and_then(|x| x.as_array())
+        {
             s.recent = list
                 .iter()
                 .filter_map(|x| x.as_str().map(str::to_string))
@@ -199,6 +218,8 @@ impl State {
                 "sharpen": self.look.sharpen,
             },
             "autoplay": self.autoplay,
+            "seek_step": self.seek_step,
+            "recent_enabled": self.recent_enabled,
             "progress": progress,
             "recent": self.recent,
         })
@@ -220,8 +241,20 @@ impl State {
         Ok(())
     }
 
-    /// 记一条「最近打开」
+    /// 开关「最近播放」。关掉时**顺手把已经攒下的列表清空** ——
+    /// 只把界面藏起来、数据还趴在 state.json 里，那不叫关。
+    pub fn set_recent_enabled(&mut self, on: bool) {
+        self.recent_enabled = on;
+        if !on {
+            self.recent.clear();
+        }
+    }
+
+    /// 记一条「最近打开」。没开「最近播放」就什么都不记。
     pub fn remember(&mut self, path: &Path) {
+        if !self.recent_enabled {
+            return;
+        }
         let s = path.to_string_lossy().into_owned();
         self.recent.retain(|x| x != &s);
         self.recent.insert(0, s);
@@ -232,7 +265,13 @@ impl State {
     ///
     /// 顺手把已经不存在的文件筛掉：用户经常下完就看、看完就删，
     /// 留一堆点了没反应的死条目比不显示还糟。
+    ///
+    /// 功能没开时直接空着：`remember` 已经不往里写了，但老配置文件里可能还留着
+    /// 关掉之前的记录，这里再兜一道，界面绝不会漏出来。
     pub fn recent_files(&self, limit: usize) -> Vec<(PathBuf, Option<Progress>)> {
+        if !self.recent_enabled {
+            return Vec::new();
+        }
         self.recent
             .iter()
             .map(PathBuf::from)
@@ -331,9 +370,14 @@ mod tests {
         s.look.brightness = 12.0;
         s.look.sharpen = 30.0;
         s.autoplay = true;
+        s.seek_step = 20.0;
+        s.recent_enabled = true;
         s.progress.insert(
             "D:/a.mkv|10|20".into(),
-            Progress { pos: 61.5, dur: 600.0 },
+            Progress {
+                pos: 61.5,
+                dur: 600.0,
+            },
         );
         s.recent = vec!["D:/a.mkv".into(), "D:/b.mp4".into()];
 
@@ -346,11 +390,49 @@ mod tests {
         assert_eq!(back.look.brightness, 12.0);
         assert_eq!(back.look.sharpen, 30.0);
         assert!(back.autoplay);
+        assert_eq!(back.seek_step, 20.0, "跳转步长要能存住");
+        assert!(back.recent_enabled, "「最近播放」开关要能存住");
         assert_eq!(
             back.progress.get("D:/a.mkv|10|20"),
-            Some(&Progress { pos: 61.5, dur: 600.0 })
+            Some(&Progress {
+                pos: 61.5,
+                dur: 600.0
+            })
         );
         assert_eq!(back.recent, vec!["D:/a.mkv", "D:/b.mp4"]);
+    }
+
+    /// 「最近播放」默认关：关着的时候既不记录，也不在空界面上摊出来
+    #[test]
+    fn recent_is_off_until_turned_on() {
+        let mut s = State::default();
+        assert!(!s.recent_enabled, "出厂默认必须是关的");
+        assert!(!State::from_json(&serde_json::json!({})).recent_enabled);
+
+        s.remember(Path::new("D:/x.mp4"));
+        assert!(s.recent.is_empty(), "关着就不该记录");
+
+        // 老配置里残留的记录，关着时也不能显示，更不能被读进内存
+        s.recent = vec!["D:/x.mp4".into()];
+        assert!(s.recent_files(5).is_empty(), "关着就不该显示");
+        let legacy = serde_json::json!({
+            "recent_enabled": false,
+            "recent": ["D:/x.mp4"],
+        });
+        assert!(
+            State::from_json(&legacy).recent.is_empty(),
+            "关着时不该读历史"
+        );
+
+        // 打开之后正常记录
+        s.set_recent_enabled(true);
+        s.remember(Path::new("D:/x.mp4"));
+        assert_eq!(s.recent, vec!["D:/x.mp4"]);
+
+        // 再关掉：已有列表一并清空，不留在文件里
+        s.set_recent_enabled(false);
+        assert!(!s.recent_enabled);
+        assert!(s.recent.is_empty(), "关掉时要把攒下的记录清掉");
     }
 
     /// 坏 JSON / 缺字段 / 类型不对：一律退回默认值，不能 panic
@@ -361,11 +443,18 @@ mod tests {
             serde_json::json!({ "volume": "很大" }),
             serde_json::json!({ "volume": 1e9, "speed": -3.0 }),
             serde_json::json!({ "progress": 7 }),
+            serde_json::json!({ "seek_step": "很久" }),
+            serde_json::json!({ "seek_step": 1e9 }),
             serde_json::json!(null),
         ] {
             let s = State::from_json(&bad);
             assert!((0.0..=100.0).contains(&s.volume), "音量必须夹在 0~100");
             assert!((0.1..=8.0).contains(&s.speed), "倍速必须夹在 0.1~8");
+            assert!(
+                (1.0..=60.0).contains(&s.seek_step),
+                "跳转步长夹在 1~60 秒：{}",
+                s.seek_step
+            );
             assert!(s.progress.is_empty() || s.progress.len() == 1);
         }
     }
@@ -393,7 +482,10 @@ mod tests {
         s.volume = 33.0;
         s.save().unwrap();
         assert!(d.join("state.json").is_file(), "应该写出 state.json");
-        assert!(!d.join("state.json.tmp").exists(), "临时文件必须被 rename 掉");
+        assert!(
+            !d.join("state.json.tmp").exists(),
+            "临时文件必须被 rename 掉"
+        );
 
         let back = State::load();
         assert_eq!(back.volume, 33.0);

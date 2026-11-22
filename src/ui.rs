@@ -53,9 +53,28 @@ pub fn fmt_dur(d: Option<f64>) -> String {
     }
 }
 
+/// 秒数的短写法：整数不带小数点（`5` 而不是 `5.0`）。
+///
+/// 「前进 5 秒」那条提示和快捷键页里「快退 / 快进 5 秒」都走这里 ——
+/// 步长改了之后两处的数字必须一模一样。
+pub fn fmt_secs(secs: f64) -> String {
+    if (secs - secs.round()).abs() < 0.01 {
+        format!("{:.0}", secs)
+    } else {
+        format!("{secs:.1}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secs_drop_the_trailing_zero() {
+        assert_eq!(fmt_secs(5.0), "5");
+        assert_eq!(fmt_secs(20.0), "20");
+        assert_eq!(fmt_secs(2.5), "2.5");
+    }
 
     #[test]
     fn elide_keeps_short_names() {
